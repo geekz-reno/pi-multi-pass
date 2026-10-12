@@ -351,6 +351,9 @@ const GOOGLE_ANTIGRAVITY_HEADERS = {
 const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
+const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+const ANTHROPIC_PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile";
+const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
 
 type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth";
 
@@ -414,6 +417,19 @@ interface CodexUsageWindow {
 	usedPercent: number;
 	windowSeconds: number;
 	resetAt?: number;
+}
+
+interface AnthropicUsageWindow {
+	/** Window label, e.g. "5h", "7d", or "7d Opus" for model-scoped limits */
+	label: string;
+	remainingPercent: number;
+	resetAt?: number;
+}
+
+interface AnthropicUsageSnapshot {
+	planType: string;
+	email: string;
+	windows: AnthropicUsageWindow[];
 }
 
 interface CodexUsageSnapshot {
@@ -1354,6 +1370,182 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	return accounts;
 }
 
+function normalizeAnthropicUsageWindow(label: string, raw: unknown): AnthropicUsageWindow | undefined {
+	const record = getRecord(raw);
+	if (!record || typeof record.utilization !== "number") return undefined;
+	return {
+		label,
+		remainingPercent: Math.max(0, Math.min(100, 100 - record.utilization)),
+		resetAt: typeof record.resets_at === "string"
+			? parseIsoTimestampSeconds(record.resets_at)
+			: undefined,
+	};
+}
+
+function parseAnthropicUsageSnapshot(data: unknown): AnthropicUsageSnapshot {
+	const raw = getRecord(data);
+	const windows = [
+		normalizeAnthropicUsageWindow("5h", raw?.five_hour),
+		normalizeAnthropicUsageWindow("7d", raw?.seven_day),
+	].filter((window): window is AnthropicUsageWindow => Boolean(window));
+
+	// Model-scoped weekly limits (e.g. Opus) ride along in `limits` with
+	// kind "weekly_scoped"; the flat five_hour/seven_day fields do not
+	// include them.
+	for (const limitValue of Array.isArray(raw?.limits) ? raw.limits : []) {
+		const limit = getRecord(limitValue);
+		if (limit?.kind !== "weekly_scoped" || typeof limit.percent !== "number") continue;
+		const scopeModel = getRecord(getRecord(limit.scope)?.model);
+		const name = typeof scopeModel?.display_name === "string" && scopeModel.display_name.length > 0
+			? scopeModel.display_name
+			: "scoped";
+		windows.push({
+			label: `7d ${name}`,
+			remainingPercent: Math.max(0, Math.min(100, 100 - limit.percent)),
+			resetAt: typeof limit.resets_at === "string"
+				? parseIsoTimestampSeconds(limit.resets_at)
+				: undefined,
+		});
+	}
+
+	return { planType: "unknown", email: "", windows };
+}
+
+function classifyAnthropicQuotaKind(snapshot: AnthropicUsageSnapshot): {
+	kind: QuotaStatusKind;
+	score: number;
+} {
+	if (snapshot.windows.length === 0) {
+		return { kind: "error", score: 0 };
+	}
+	const bottleneck = Math.min(...snapshot.windows.map((window) => window.remainingPercent));
+	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
+	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
+	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
+	return { kind: "ready", score: bottleneck };
+}
+
+async function fetchAnthropicProfile(
+	headers: Headers,
+	signal?: AbortSignal,
+): Promise<{ planType: string; email: string }> {
+	try {
+		const response = await fetch(ANTHROPIC_PROFILE_ENDPOINT, { headers, signal });
+		if (!response.ok) return { planType: "unknown", email: "" };
+		const raw = getRecord(await response.json());
+		const account = getRecord(raw?.account);
+		return {
+			planType: account?.has_claude_max === true
+				? "max"
+				: account?.has_claude_pro === true ? "pro" : "unknown",
+			email: typeof account?.email === "string" ? account.email : "",
+		};
+	} catch (error) {
+		if (isAbortError(error)) throw error;
+		return { planType: "unknown", email: "" };
+	}
+}
+
+const anthropicQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "anthropic",
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		const auth = account.auth;
+		if (!auth || auth.type !== "oauth" || typeof auth.access !== "string" || auth.access.length === 0) {
+			return {
+				account,
+				kind: "missing-auth",
+				summary: "not logged in",
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					"status: not logged in",
+					"login: use /subs login or /login to authenticate this account",
+				],
+				score: 0,
+			};
+		}
+
+		const headers = new Headers({
+			Authorization: `Bearer ${auth.access}`,
+			"anthropic-beta": ANTHROPIC_OAUTH_BETA,
+			Accept: "application/json",
+		});
+
+		try {
+			const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
+				method: "GET",
+				headers,
+				signal,
+			});
+			if (!response.ok) {
+				const error = await readResponseError(response);
+				return {
+					account,
+					kind: "error",
+					summary: error,
+					details: [
+						`account: ${account.displayName}`,
+						`provider: ${account.providerName}`,
+						"status: error",
+						`details: ${error}`,
+					],
+					score: 0,
+				};
+			}
+
+			const snapshot = parseAnthropicUsageSnapshot(await response.json());
+			const profile = await fetchAnthropicProfile(headers, signal);
+			snapshot.planType = profile.planType;
+			snapshot.email = profile.email;
+
+			const classification = classifyAnthropicQuotaKind(snapshot);
+			const summary = [
+				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
+				...snapshot.windows.map((window) =>
+					`${window.label} ${formatRemainingPercent(window.remainingPercent)} (${formatResetShort(window.resetAt)})`),
+				formatQuotaKind(classification.kind),
+			].join(" | ");
+			const details = [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${formatQuotaKind(classification.kind)}`,
+				`plan: ${snapshot.planType}`,
+			];
+			if (snapshot.email) {
+				details.push(`email: ${snapshot.email}`);
+			}
+			for (const window of snapshot.windows) {
+				details.push(
+					`${window.label} window: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}`,
+				);
+			}
+			details.push(`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`);
+			return {
+				account,
+				kind: classification.kind,
+				summary,
+				details,
+				score: classification.score,
+			};
+		} catch (error: unknown) {
+			if (signal?.aborted || isAbortError(error)) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			return {
+				account,
+				kind: "error",
+				summary: message,
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					"status: error",
+					`details: ${message}`,
+				],
+				score: 0,
+			};
+		}
+	},
+};
+
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
 	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
@@ -1478,6 +1670,7 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 };
 
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
+	anthropicQuotaChecker,
 	codexQuotaChecker,
 	googleGeminiCliQuotaChecker,
 	googleAntigravityQuotaChecker,
@@ -5478,7 +5671,7 @@ async function handleSubsMenu(
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
-		{ value: "limits", label: "limits", description: "Check built-in quota support (Codex + Google)" },
+		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 	];
 	let preferredAction = "list";
 

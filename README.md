@@ -22,7 +22,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
-- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
+- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google)
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
@@ -39,7 +39,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /subs add              Pick a provider, add a subscription
 /login                 Authenticate the new subscription
 /subs switch           Manually switch to another subscription/provider
-/subs limits           Check built-in quota support (Codex + Google)
+/subs limits           Check built-in quota support (Anthropic + Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
 /pool trace start      Start recording routing decisions for this session
@@ -383,6 +383,7 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 
 Currently implemented:
 
+- `anthropic`: fetches Claude subscription usage from `https://api.anthropic.com/api/oauth/usage`, then summarizes the 5-hour and 7-day windows plus any model-scoped weekly limits (for example Opus) for the base account and extra Anthropic subscriptions. Plan and email come from the OAuth profile endpoint.
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
 - `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
 - `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
