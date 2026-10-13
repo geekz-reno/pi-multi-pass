@@ -57,6 +57,7 @@ import {
 	getAgentDir,
 	keyHint,
 	readStoredCredential,
+	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
 	builtinProviders,
@@ -68,6 +69,7 @@ import {
 	Container,
 	Key,
 	SelectList,
+	Spacer,
 	Text,
 	matchesKey,
 	type SelectItem,
@@ -400,12 +402,37 @@ interface QuotaAccount {
 	auth?: AuthStorageEntry;
 }
 
+/** Structured quota window used by the card renderer. */
+interface QuotaDisplayWindow {
+	/** Short label, e.g. "5h", "7d", "7d Opus", or a Google model name. */
+	label: string;
+	remainingPercent?: number;
+	resetAt?: number;
+}
+
+/** Codex-only: stored rate-limit reset credits summary. */
+interface QuotaResetCredits {
+	available: number;
+	/** Credits applicable to the current rate-limit window right now. */
+	applicable: number;
+}
+
 interface QuotaCheckResult {
 	account: QuotaAccount;
 	kind: QuotaStatusKind;
 	summary: string;
 	details: string[];
 	score: number;
+	/** Structured fields consumed by the TUI card renderer. The flat
+	 * `details` array is kept for text drilldown and non-UI fallback. */
+	planType?: string;
+	email?: string;
+	windows?: QuotaDisplayWindow[];
+	models?: QuotaDisplayWindow[];
+	worstRemainingPercent?: number;
+	resetCredits?: QuotaResetCredits;
+	extraUsage?: boolean;
+	projectId?: string;
 }
 
 interface ProviderQuotaChecker {
@@ -542,6 +569,21 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 function getCodexWindowRemaining(window: CodexUsageWindow | undefined): number | undefined {
 	if (!window) return undefined;
 	return Math.max(0, Math.min(100, 100 - window.usedPercent));
+}
+
+/** Parse `rate_limit_reset_credits` from the Codex usage payload. These
+ * are stored resets that reduce the Codex rate limit when applied; the
+ * `applicable_available_count` subset is usable against the current
+ * window right now. */
+function parseCodexResetCredits(data: unknown): QuotaResetCredits | undefined {
+	const raw = getRecord(getRecord(data)?.rate_limit_reset_credits);
+	if (!raw) return undefined;
+	const available = typeof raw.available_count === "number" ? raw.available_count : 0;
+	if (available <= 0) return undefined;
+	const applicable = typeof raw.applicable_available_count === "number"
+		? raw.applicable_available_count
+		: 0;
+	return { available, applicable };
 }
 
 function formatResetShort(resetAt?: number): string {
@@ -1307,12 +1349,26 @@ async function checkGoogleQuotaAccount(
 		}
 
 		const classification = classifyGoogleQuotaKind(snapshot);
+		const sortedModels = [...snapshot.models]
+			.sort((left, right) => {
+				const leftPercent = left.remainingPercent ?? 101;
+				const rightPercent = right.remainingPercent ?? 101;
+				return leftPercent - rightPercent || left.model.localeCompare(right.model);
+			})
+			.map((model): QuotaDisplayWindow => ({
+				label: model.model,
+				remainingPercent: model.remainingPercent,
+				resetAt: model.resetAt,
+			}));
 		return {
 			account,
 			kind: classification.kind,
 			summary: `${getGoogleQuotaBucketLabel(account, snapshot.models.length)} | bottleneck ${formatRemainingPercent(snapshot.worstRemainingPercent)} | ${formatQuotaKind(classification.kind)}`,
 			details: formatGoogleQuotaDetails(account, snapshot, classification.kind),
 			score: classification.score,
+			models: sortedModels.length > 0 ? sortedModels : undefined,
+			worstRemainingPercent: snapshot.worstRemainingPercent,
+			projectId: snapshot.projectId,
 		};
 	} catch (error: unknown) {
 		if (signal?.aborted || isAbortError(error)) throw error;
@@ -1411,6 +1467,15 @@ function parseAnthropicUsageSnapshot(data: unknown): AnthropicUsageSnapshot {
 	return { planType: "unknown", email: "", windows };
 }
 
+/** Anthropic enables "extra usage" (pay-as-you-go overflow) via a top-
+ * level `extra_usage` block. The toggle is server-side; `user_disabled`
+ * means the account has opted out even though the plan allows it. */
+function parseAnthropicExtraUsage(data: unknown): boolean | undefined {
+	const raw = getRecord(getRecord(data)?.extra_usage);
+	if (!raw) return undefined;
+	return raw.is_enabled === true && raw.user_disabled !== true ? true : undefined;
+}
+
 function classifyAnthropicQuotaKind(snapshot: AnthropicUsageSnapshot): {
 	kind: QuotaStatusKind;
 	score: number;
@@ -1493,12 +1558,14 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 				};
 			}
 
-			const snapshot = parseAnthropicUsageSnapshot(await response.json());
+			const rawData = await response.json();
+			const snapshot = parseAnthropicUsageSnapshot(rawData);
 			const profile = await fetchAnthropicProfile(headers, signal);
 			snapshot.planType = profile.planType;
 			snapshot.email = profile.email;
 
 			const classification = classifyAnthropicQuotaKind(snapshot);
+			const extraUsage = parseAnthropicExtraUsage(rawData);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
 				...snapshot.windows.map((window) =>
@@ -1519,13 +1586,28 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 					`${window.label} window: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}`,
 				);
 			}
+			if (extraUsage) {
+				details.push("extra usage: enabled");
+			}
 			details.push(`endpoint: ${ANTHROPIC_USAGE_ENDPOINT}`);
+			const windows: QuotaDisplayWindow[] = snapshot.windows.map((w) => ({
+				label: w.label,
+				remainingPercent: w.remainingPercent,
+				resetAt: w.resetAt,
+			}));
 			return {
 				account,
 				kind: classification.kind,
 				summary,
 				details,
 				score: classification.score,
+				planType: snapshot.planType,
+				email: snapshot.email || undefined,
+				windows: windows.length > 0 ? windows : undefined,
+				worstRemainingPercent: windows.length > 0
+					? Math.min(...windows.map((w) => w.remainingPercent).filter((v): v is number => v !== undefined))
+					: undefined,
+				extraUsage,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -1601,7 +1683,8 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				};
 			}
 
-			const snapshot = parseCodexUsageSnapshot(await response.json());
+			const rawData = await response.json();
+			const snapshot = parseCodexUsageSnapshot(rawData);
 			if (!snapshot.email && tokenMetadata.email) snapshot.email = tokenMetadata.email;
 			if ((!snapshot.planType || snapshot.planType === "unknown") && tokenMetadata.planType) {
 				snapshot.planType = tokenMetadata.planType;
@@ -1609,6 +1692,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
 			const classification = classifyCodexQuotaKind(snapshot);
+			const resetCredits = parseCodexResetCredits(rawData);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
 				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
@@ -1627,14 +1711,35 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			details.push(
 				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
 				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-				`endpoint: ${baseUrl}/wham/usage`,
 			);
+			if (resetCredits) {
+				const base = `${resetCredits.available} stored reset${resetCredits.available === 1 ? "" : "s"}`;
+				details.push(resetCredits.applicable > 0
+					? `reset credits: ${base} - usable now (${resetCredits.applicable} applicable)`
+					: `reset credits: ${base}`);
+			}
+			details.push(`endpoint: ${baseUrl}/wham/usage`);
+			const windows: QuotaDisplayWindow[] = [];
+			if (snapshot.fiveHour) {
+				windows.push({ label: "5h", remainingPercent: fiveHourLeft, resetAt: snapshot.fiveHour.resetAt });
+			}
+			if (snapshot.weekly) {
+				windows.push({ label: "7d", remainingPercent: weeklyLeft, resetAt: snapshot.weekly.resetAt });
+			}
+			const remainingValues = windows
+				.map((w) => w.remainingPercent)
+				.filter((v): v is number => v !== undefined);
 			return {
 				account,
 				kind: classification.kind,
 				summary,
 				details,
 				score: classification.score,
+				planType: snapshot.planType,
+				email: snapshot.email || undefined,
+				windows: windows.length > 0 ? windows : undefined,
+				worstRemainingPercent: remainingValues.length > 0 ? Math.min(...remainingValues) : undefined,
+				resetCredits,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -1689,6 +1794,221 @@ async function showQuotaDetails(
 	});
 }
 
+// ==========================================================================
+// Card view for /subs limits (TUI)
+// ==========================================================================
+
+const QUOTA_BAR_WIDTH = 20;
+
+/** Map a remaining-percent value to the theme colour used for its bar
+ * and status badge. Mirrors the bands in `classifyCodexQuotaKind` and
+ * the omarchy bar widget. */
+function quotaBarColor(remainingPercent: number | undefined): "success" | "warning" | "error" | "dim" {
+	if (remainingPercent === undefined) return "dim";
+	if (remainingPercent <= 15) return "error";
+	if (remainingPercent <= 30) return "warning";
+	return "success";
+}
+
+/** Render a progress-bar row: `label  ███████░░░░░░  58% left · resets ~2h`.
+ * Colour-coded fill tracks the severity band so cards communicate at a
+ * glance even without reading the number. */
+function renderQuotaBar(
+	theme: Theme,
+	label: string,
+	window: QuotaDisplayWindow,
+): string {
+	const percent = window.remainingPercent;
+	const colorKey = quotaBarColor(percent);
+	const filled = percent !== undefined
+		? Math.max(0, Math.min(QUOTA_BAR_WIDTH, Math.round((percent / 100) * QUOTA_BAR_WIDTH)))
+		: 0;
+	const bar = "\u2588".repeat(filled) + "\u2591".repeat(QUOTA_BAR_WIDTH - filled);
+	const coloredBar = theme.fg(colorKey, bar);
+	const percentText = percent === undefined
+		? "--"
+		: `${Math.round(percent)}% left`;
+	const coloredPercent = theme.fg(colorKey, theme.bold(percentText));
+	const resetText = window.resetAt
+		? theme.fg("dim", `  resets ${formatResetShort(window.resetAt)}`)
+		: "";
+	const paddedLabel = theme.fg("muted", label.padEnd(14));
+	return `${paddedLabel}  ${coloredBar}  ${coloredPercent}${resetText}`;
+}
+
+function renderQuotaStatusBadge(theme: Theme, kind: QuotaStatusKind): string {
+	const glyph = getQuotaStatusGlyph(kind);
+	const label = formatQuotaKind(kind);
+	switch (kind) {
+		case "ready":
+			return theme.fg("success", theme.bold(`${glyph} ${label}`));
+		case "watch":
+			return theme.fg("warning", theme.bold(`${glyph} ${label}`));
+		case "low":
+		case "blocked":
+			return theme.fg("error", theme.bold(`${glyph} ${label}`));
+		case "missing-auth":
+			return theme.fg("warning", `${glyph} ${label}`);
+		default:
+			return theme.fg("dim", `${glyph} ${label}`);
+	}
+}
+
+/** Build one card's text lines (styled, ready to drop into Text
+ * components). Each card is a vertical stack: title row, optional
+ * meta row, progress bars, optional badges. */
+function renderQuotaCardLines(
+	theme: Theme,
+	result: QuotaCheckResult,
+	options: { selected: boolean; isCurrent: boolean; isBest: boolean },
+): string[] {
+	const { account } = result;
+	const prefix = options.selected ? theme.fg("accent", theme.bold("\u2192 ")) : "  ";
+	const nameStyle = options.selected ? theme.fg("accent", theme.bold(account.displayName)) : theme.bold(account.displayName);
+
+	const metaParts: string[] = [];
+	if (result.planType && result.planType !== "unknown") metaParts.push(result.planType);
+	if (result.email) metaParts.push(result.email);
+	if (result.projectId) metaParts.push(`project ${result.projectId}`);
+	const meta = metaParts.length > 0 ? theme.fg("dim", `  ${metaParts.join(" \u00b7 ")}`) : "";
+
+	const badges: string[] = [];
+	if (options.isCurrent) badges.push(theme.fg("accent", theme.bold("active")));
+	if (options.isBest && !options.isCurrent) badges.push(theme.fg("success", "best now"));
+	const badgeText = badges.length > 0 ? ` ${badges.join(" \u00b7 ")}` : "";
+
+	const lines: string[] = [];
+	lines.push(`${prefix}${nameStyle}${badgeText}  ${renderQuotaStatusBadge(theme, result.kind)}`);
+	if (meta) lines.push(meta);
+
+	const windows = result.windows || [];
+	const models = result.models || [];
+	for (const window of windows) {
+		lines.push(`    ${renderQuotaBar(theme, formatWindowLabel(window.label), window)}`);
+	}
+	for (const model of models) {
+		lines.push(`    ${renderQuotaBar(theme, model.label, model)}`);
+	}
+
+	if (windows.length === 0 && models.length === 0) {
+		lines.push(theme.fg("muted", `    ${result.summary}`));
+	}
+
+	if (result.resetCredits) {
+		const rc = result.resetCredits;
+		const base = `${rc.available} stored reset${rc.available === 1 ? "" : "s"}`;
+		if (rc.applicable > 0) {
+			lines.push(`    ${theme.fg("success", theme.bold(`\u21ba ${base} \u00b7 usable now!`))}`);
+		} else {
+			lines.push(`    ${theme.fg("accent", `\u21ba ${base}`)}`);
+		}
+	}
+	if (result.extraUsage) {
+		lines.push(`    ${theme.fg("dim", "extra usage enabled")}`);
+	}
+	return lines;
+}
+
+/** Translate internal window labels ("5h", "7d", "7d Opus") into the
+ * same human text used by the Panel.qml card. */
+function formatWindowLabel(id: string): string {
+	if (id === "5h") return "5-hour window";
+	if (id === "7d") return "weekly";
+	if (id.startsWith("7d ")) return `weekly \u00b7 ${id.slice(3)}`;
+	return id;
+}
+
+/** Scrollable card view for `/subs limits`. Replaces the single-line
+ * SelectList with per-account tiles: progress bars, reset times,
+ * reset-credit badges, and an active-session marker. Enter opens the
+ * raw text details for the highlighted account; Esc closes. */
+async function selectQuotaResultCards(
+	ctx: ExtensionCommandContext,
+	results: QuotaCheckResult[],
+	preferredProviderName?: string,
+): Promise<QuotaCheckResult | undefined> {
+	if (!ctx.hasUI) {
+		return selectQuotaResult(ctx, results, preferredProviderName);
+	}
+
+	const currentProviderName = preferredProviderName || ctx.model?.provider;
+	const bestProviderName = results[0]?.account.providerName;
+	const initialIndex = Math.max(
+		0,
+		results.findIndex((r) => r.account.providerName === currentProviderName),
+	);
+
+	const picked = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		const container = new Container();
+		let selectedIndex = initialIndex >= 0 ? initialIndex : 0;
+
+		const header = new Text(theme.fg("accent", theme.bold("Subscription Limits")));
+		const overview = new Text(theme.fg("dim", formatQuotaOverview(results)));
+		const cardsContainer = new Container();
+		const footer = new Text(theme.fg("dim", [
+			keyHint("tui.select.up", "up"),
+			keyHint("tui.select.down", "down"),
+			keyHint("tui.select.confirm", "details"),
+			keyHint("tui.select.cancel", "close"),
+		].join(" \u2022 ")));
+
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+		container.addChild(header);
+		container.addChild(overview);
+		container.addChild(new Spacer(1));
+		container.addChild(cardsContainer);
+		container.addChild(footer);
+		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+		const rebuildCards = () => {
+			cardsContainer.clear();
+			results.forEach((result, index) => {
+				const lines = renderQuotaCardLines(theme, result, {
+					selected: index === selectedIndex,
+					isCurrent: result.account.providerName === currentProviderName,
+					isBest: result.account.providerName === bestProviderName,
+				});
+				for (const line of lines) cardsContainer.addChild(new Text(line));
+				if (index < results.length - 1) cardsContainer.addChild(new Spacer(1));
+			});
+		};
+		rebuildCards();
+
+		return {
+			render(width: number) {
+				return container.render(width);
+			},
+			invalidate() {
+				container.invalidate();
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, Key.up)) {
+					selectedIndex = selectedIndex === 0 ? results.length - 1 : selectedIndex - 1;
+					rebuildCards();
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, Key.down)) {
+					selectedIndex = selectedIndex === results.length - 1 ? 0 : selectedIndex + 1;
+					rebuildCards();
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, Key.enter)) {
+					done(results[selectedIndex]?.account.providerName || null);
+					return;
+				}
+				if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+					done(null);
+				}
+			},
+		};
+	});
+
+	if (!picked) return undefined;
+	return results.find((r) => r.account.providerName === picked);
+}
+
 async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
 	const accounts = collectQuotaAccounts(ctx);
@@ -1715,7 +2035,7 @@ async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 
 	let preferredProviderName = ctx.model?.provider;
 	while (true) {
-		const selected = await selectQuotaResult(ctx, results, preferredProviderName);
+		const selected = await selectQuotaResultCards(ctx, results, preferredProviderName);
 		if (!selected) return;
 		preferredProviderName = selected.account.providerName;
 		await showQuotaDetails(ctx, selected);

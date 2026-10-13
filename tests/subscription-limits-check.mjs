@@ -308,10 +308,56 @@ function runDisplayNameChecks() {
   );
 }
 
+function parseCodexResetCredits(data) {
+  const raw = data?.rate_limit_reset_credits;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const available = typeof raw.available_count === "number" ? raw.available_count : 0;
+  if (available <= 0) return undefined;
+  const applicable = typeof raw.applicable_available_count === "number"
+    ? raw.applicable_available_count
+    : 0;
+  return { available, applicable };
+}
+
+function runCodexResetCreditsChecks() {
+  assert.equal(parseCodexResetCredits({}), undefined);
+  assert.equal(parseCodexResetCredits({ rate_limit_reset_credits: { available_count: 0 } }), undefined);
+  assert.deepEqual(
+    parseCodexResetCredits({
+      rate_limit_reset_credits: { available_count: 3, applicable_available_count: 1 },
+    }),
+    { available: 3, applicable: 1 },
+  );
+  // Missing applicable_available_count defaults to 0.
+  assert.deepEqual(
+    parseCodexResetCredits({ rate_limit_reset_credits: { available_count: 2 } }),
+    { available: 2, applicable: 0 },
+  );
+}
+
+function quotaBarColor(remainingPercent) {
+  if (remainingPercent === undefined) return "dim";
+  if (remainingPercent <= 15) return "error";
+  if (remainingPercent <= 30) return "warning";
+  return "success";
+}
+
+function runQuotaBarColorChecks() {
+  assert.equal(quotaBarColor(undefined), "dim");
+  assert.equal(quotaBarColor(0), "error");
+  assert.equal(quotaBarColor(15), "error");
+  assert.equal(quotaBarColor(16), "warning");
+  assert.equal(quotaBarColor(30), "warning");
+  assert.equal(quotaBarColor(31), "success");
+  assert.equal(quotaBarColor(100), "success");
+}
+
 runWindowClassificationChecks();
 runSeverityChecks();
 runGoogleGeminiQuotaParsingChecks();
 runGoogleAntigravityQuotaParsingChecks();
 runGoogleClassificationChecks();
 runDisplayNameChecks();
+runCodexResetCreditsChecks();
+runQuotaBarColorChecks();
 console.log("subscription limit checks passed");
