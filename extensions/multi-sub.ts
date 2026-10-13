@@ -2517,8 +2517,8 @@ function subDisplayName(entry: SubEntry): string {
 }
 
 function subscriptionLoginName(entry: SubEntry): string {
-	return PROVIDER_TEMPLATES[entry.provider]?.buildOAuth?.(entry.index).name
-		?? subProviderName(entry);
+	if (!PROVIDER_TEMPLATES[entry.provider]?.buildOAuth) return subProviderName(entry);
+	return subDisplayName(entry);
 }
 
 /** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
@@ -2611,7 +2611,9 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth?.(entry.index);
+	const oauth = template.buildOAuth
+		? { ...template.buildOAuth(entry.index), name: subDisplayName(entry) }
+		: undefined;
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
@@ -3712,6 +3714,7 @@ async function handleSubsSwitch(
 }
 
 async function renameSubscriptionLabel(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	config: MultiPassConfig,
 	entry: SubEntry,
@@ -3731,6 +3734,9 @@ async function renameSubscriptionLabel(
 		ctx.ui.notify(`No changes for ${nextName}.`, "info");
 		return;
 	}
+
+	registerSub(pi, entry);
+	ctx.modelRegistry.refresh();
 
 	ctx.ui.notify(`Updated ${previousName} -> ${nextName}`, "info");
 }
@@ -3832,7 +3838,7 @@ async function showSubscriptionActions(
 	if (!action) return;
 
 	if (action === "rename") {
-		return renameSubscriptionLabel(ctx, config, entry);
+		return renameSubscriptionLabel(pi, ctx, config, entry);
 	}
 	if (action === "login") {
 		ctx.ui.notify(
