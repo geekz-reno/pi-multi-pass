@@ -135,4 +135,25 @@ const usageFixture = {
   assert.equal(classifyAnthropicQuotaKind(snapshot).kind, "error");
 }
 
+// parseAnthropicExtraUsage: mirrors multi-sub.ts
+function parseAnthropicExtraUsage(data) {
+  const raw = getRecord(getRecord(data)?.extra_usage);
+  if (!raw) return undefined;
+  return raw.is_enabled === true && raw.user_disabled !== true ? true : undefined;
+}
+
+{
+  assert.equal(parseAnthropicExtraUsage({}), undefined);
+  assert.equal(parseAnthropicExtraUsage({ extra_usage: null }), undefined);
+  assert.equal(parseAnthropicExtraUsage({ extra_usage: { is_enabled: true } }), true);
+  assert.equal(
+    parseAnthropicExtraUsage({ extra_usage: { is_enabled: true, user_disabled: true } }),
+    undefined,
+  );
+  assert.equal(
+    parseAnthropicExtraUsage({ extra_usage: { is_enabled: false } }),
+    undefined,
+  );
+}
+
 console.log("anthropic-limits-check: all assertions passed");
