@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/header.svg" alt="pi-multi-pass" width="800"/>
+  <img src="docs/header-v2.svg" alt="pi-multi-pass" width="800"/>
 </p>
 
 <p align="center">
