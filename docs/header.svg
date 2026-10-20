@@ -14,25 +14,25 @@
     <text x="184" y="234" font-size="23" fill="#9292a2">rate-limit rotation, pools and chains</text>
   </g>
 
-  <!-- account panel: per-account headroom, rotating to the next account -->
+  <!-- multipass card: per-account headroom -->
   <g>
     <rect x="876" y="56" width="268" height="208" rx="22" fill="#1d1d26"/>
 
-    <circle cx="912" cy="97" r="7" fill="#53b584"/>
-    <rect x="932" y="90" width="180" height="14" rx="7" fill="#373746"/>
-    <rect x="932" y="90" width="131" height="14" rx="7" fill="#53b584"/>
+    <circle cx="912" cy="96" r="7" fill="#53b584"/>
+    <rect x="932" y="89" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="89" width="131" height="14" rx="7" fill="#53b584"/>
 
-    <circle cx="912" cy="139" r="7" fill="#e0a63c"/>
-    <rect x="932" y="132" width="180" height="14" rx="7" fill="#373746"/>
-    <rect x="932" y="132" width="68" height="14" rx="7" fill="#e0a63c"/>
+    <circle cx="912" cy="134" r="7" fill="#e0a63c"/>
+    <rect x="932" y="127" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="127" width="68" height="14" rx="7" fill="#e0a63c"/>
 
-    <circle cx="912" cy="181" r="7" fill="#e05c5c"/>
-    <rect x="932" y="174" width="180" height="14" rx="7" fill="#373746"/>
-    <rect x="932" y="174" width="22" height="14" rx="7" fill="#e05c5c"/>
+    <circle cx="912" cy="172" r="7" fill="#e05c5c"/>
+    <rect x="932" y="165" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="165" width="22" height="14" rx="7" fill="#e05c5c"/>
 
-    <g stroke="#d63084" stroke-width="7" fill="none" stroke-linecap="round">
-      <path d="M 988 238 a 22 22 0 1 0 22 -22"/>
-    </g>
-    <path d="M 1010 203 l 17 13 l -17 13 z" fill="#d63084"/>
+    <rect x="900" y="204" width="220" height="38" rx="19" fill="#2b2b38"/>
+    <text x="1010" y="230" text-anchor="middle" font-size="21" font-weight="700"
+          letter-spacing="3" fill="#d63084"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">MULTIPASS</text>
   </g>
 </svg>

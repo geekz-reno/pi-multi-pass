@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <em>leeloo dallas. multi-pass.</em>
+</p>
+
+<p align="center">
   Multi-subscription extension for <a href="https://github.com/earendil-works/pi">pi</a> -- use multiple OAuth
   accounts per provider with automatic rate-limit rotation and project-level affinity.
 </p>
