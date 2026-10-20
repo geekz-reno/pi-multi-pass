@@ -1,6 +1,13 @@
-# pi-multi-pass
+<p align="center">
+  <img src="docs/header.svg" alt="pi-multi-pass" width="800"/>
+</p>
 
-Multi-subscription extension for [pi](https://github.com/earendil-works/pi) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+<p align="center">
+  Multi-subscription extension for <a href="https://github.com/earendil-works/pi">pi</a> -- use multiple OAuth
+  accounts per provider with automatic rate-limit rotation and project-level affinity.
+</p>
+
+---
 
 ## Install
 
@@ -24,6 +31,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google)
 - **Experimental offline OAuth sharing**: Copy one selected account using QR frames or a single copy/paste export string (no network required)
+- **Opt-in token keeper**: One OAuth refresh per machine instead of one per pi process, so parallel sessions cannot burn each other's rotating refresh tokens (`/subs keeper`)
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
@@ -66,7 +74,31 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
 /subs share        Show offline QR frames or a full copyable export string (experimental)
 /subs receive      Paste the full string or frame URIs into another pi
+/subs keeper       Toggle the shared OAuth token keeper (off by default)
 ```
+
+### `/subs keeper` -- shared OAuth token keeper (opt-in)
+
+Anthropic and OpenAI rotate the refresh token on every refresh and reject the
+previous one (`refresh_token_reused`, `invalid_grant`). A rotation that never
+reaches `auth.json` therefore costs the login. With many pi processes sharing
+one `auth.json`, pi's per-process refresh loses that race often enough to
+matter: its refresh deadline (15s) or its credential lock (30s stale) can
+expire after the provider has already rotated.
+
+Enabled with `/subs keeper` (or `"tokenKeeper": true` in
+`~/.pi/agent/multi-pass.json`), multi-pass takes over refreshes:
+
+- renews tokens 15 minutes before expiry, ahead of pi's own 5-minute window
+- holds the same `auth.json` lock pi uses, re-reads inside it, and skips the
+  network when another process already stored a usable token
+- writes the rotated credential in that same locked transaction, so a slow
+  provider or a cancelled request cannot drop it
+- covers built-in logins (`anthropic`, `openai-codex`, ...) as well as extra
+  subscriptions
+
+Off by default: it changes who refreshes your credentials, so enable it only
+if you actually run several pi sessions at once.
 
 ### `/pool` -- Rotation pool and chain management
 

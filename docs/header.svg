@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="pi-multi-pass">
+  <rect width="1200" height="320" fill="#15151b"/>
+
+  <!-- pi glyph -->
+  <g fill="#d63084">
+    <rect x="62" y="110" width="92" height="18" rx="4"/>
+    <path d="M 84 128 h 18 l -5 70 h -18 z"/>
+    <path d="M 124 128 h 18 l 5 70 h -18 z"/>
+  </g>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">
+    <text x="182" y="158" font-size="62" font-weight="700" fill="#e8e8ee">pi-multi-pass</text>
+    <text x="184" y="200" font-size="23" fill="#9292a2">multiple oauth accounts per provider,</text>
+    <text x="184" y="234" font-size="23" fill="#9292a2">rate-limit rotation, pools and chains</text>
+  </g>
+
+  <!-- account panel: per-account headroom, rotating to the next account -->
+  <g>
+    <rect x="876" y="56" width="268" height="208" rx="22" fill="#1d1d26"/>
+
+    <circle cx="912" cy="97" r="7" fill="#53b584"/>
+    <rect x="932" y="90" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="90" width="131" height="14" rx="7" fill="#53b584"/>
+
+    <circle cx="912" cy="139" r="7" fill="#e0a63c"/>
+    <rect x="932" y="132" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="132" width="68" height="14" rx="7" fill="#e0a63c"/>
+
+    <circle cx="912" cy="181" r="7" fill="#e05c5c"/>
+    <rect x="932" y="174" width="180" height="14" rx="7" fill="#373746"/>
+    <rect x="932" y="174" width="22" height="14" rx="7" fill="#e05c5c"/>
+
+    <g stroke="#d63084" stroke-width="7" fill="none" stroke-linecap="round">
+      <path d="M 988 238 a 22 22 0 1 0 22 -22"/>
+    </g>
+    <path d="M 1010 203 l 17 13 l -17 13 z" fill="#d63084"/>
+  </g>
+</svg>

@@ -406,6 +406,149 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 	};
 }
 
+// ==========================================================================
+// Shared auth.json access and OAuth token keeper
+// ==========================================================================
+
+type AuthFile = Record<string, AuthStorageEntry>;
+
+/** Treat a stored token as usable while it has at least this much validity. */
+const AUTH_REFRESH_SKEW_MS = 60_000;
+/** Refresh this far ahead of expiry, before pi's own five-minute window. */
+const TOKEN_KEEPER_LEAD_MS = 15 * 60_000;
+const TOKEN_KEEPER_INTERVAL_MS = 60_000;
+const TOKEN_REFRESH_TIMEOUT_MS = 25_000;
+
+function getAuthFilePath(): string {
+	return join(getAgentDir(), "auth.json");
+}
+
+function readAuthFile(path = getAuthFilePath()): AuthFile {
+	if (!existsSync(path)) return {};
+	const parsed = JSON.parse(readFileSync(path, "utf-8"));
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("Invalid auth.json: expected an object");
+	}
+	return parsed as AuthFile;
+}
+
+/**
+ * Run `edit` while holding the same lock pi takes for auth.json, writing the
+ * map back only when the edit reports a change.
+ */
+async function withAuthFile<T>(
+	edit: (stored: AuthFile) => Promise<{ value: T; changed?: boolean }> | { value: T; changed?: boolean },
+): Promise<T> {
+	const path = getAuthFilePath();
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	if (!existsSync(path)) writeFileSync(path, "{}", { mode: 0o600 });
+	const release = await lockfile.lock(path, { realpath: false, retries: { retries: 10, minTimeout: 50 } });
+	try {
+		const stored = readAuthFile(path);
+		const { value, changed } = await edit(stored);
+		if (changed) writeFileSync(path, JSON.stringify(stored, null, 2), { mode: 0o600 });
+		return value;
+	} finally {
+		await release();
+	}
+}
+
+function isOAuthEntry(
+	entry: AuthStorageEntry | undefined,
+): entry is AuthStorageEntry & { type: "oauth"; refresh: string; expires: number } {
+	return entry?.type === "oauth"
+		&& typeof entry.refresh === "string"
+		&& entry.refresh.length > 0
+		&& typeof entry.expires === "number";
+}
+
+/** Base provider of a stored account name, e.g. `anthropic-2` -> `anthropic`. */
+function baseProviderForAccount(account: string): string | undefined {
+	if (PROVIDER_TEMPLATES[account]?.buildOAuth) return account;
+	const base = account.match(/^(.+)-\d+$/)?.[1];
+	return base && PROVIDER_TEMPLATES[base]?.buildOAuth ? base : undefined;
+}
+
+const refreshesInFlight = new Map<string, Promise<OAuthCredentials>>();
+
+/**
+ * Refresh `account` and store the rotated credential in the same locked
+ * transaction. Anthropic and OpenAI invalidate the old refresh token the
+ * moment they answer, so a rotation that is not written costs the login:
+ * pi drops it whenever its 15s refresh deadline or its auth.json lock runs
+ * out first, which is routine with many concurrent sessions.
+ */
+function keepFreshCredential(
+	account: string,
+	baseProvider: string,
+	hint?: OAuthCredentials,
+): Promise<OAuthCredentials> {
+	const inFlight = refreshesInFlight.get(account);
+	if (inFlight) return inFlight;
+
+	const run = withAuthFile(async (stored) => {
+		const current = stored[account];
+		if (isOAuthEntry(current) && current.expires > Date.now() + AUTH_REFRESH_SKEW_MS) {
+			return { value: current as unknown as OAuthCredentials };
+		}
+		const credential = isOAuthEntry(current) ? current : hint;
+		if (!credential || typeof credential.refresh !== "string" || credential.refresh.length === 0) {
+			throw new Error(`No refresh token stored for ${account}`);
+		}
+		const refreshed = await getBuiltinOAuthFlow(baseProvider).refresh(
+			asOAuthCredential(credential as OAuthCredentials),
+			AbortSignal.timeout(TOKEN_REFRESH_TIMEOUT_MS),
+		);
+		stored[account] = { ...current, ...refreshed, type: "oauth" };
+		return { value: refreshed, changed: true };
+	}).finally(() => refreshesInFlight.delete(account));
+
+	refreshesInFlight.set(account, run);
+	return run;
+}
+
+let tokenKeeperTimer: ReturnType<typeof setInterval> | undefined;
+
+/** Opt-in: `"tokenKeeper": true` in ~/.pi/agent/multi-pass.json, or /subs keeper. */
+function isTokenKeeperEnabled(): boolean {
+	return loadGlobalConfig().tokenKeeper === true;
+}
+
+/**
+ * Renew every stored subscription token ahead of pi's own refresh window so
+ * the rotation happens once per machine instead of racing in each session.
+ * Covers built-in logins too, which pi otherwise refreshes per process.
+ */
+function startTokenKeeper(): void {
+	if (tokenKeeperTimer || !isTokenKeeperEnabled()) return;
+
+	const tick = async (): Promise<void> => {
+		let stored: AuthFile;
+		try {
+			stored = readAuthFile();
+		} catch {
+			return;
+		}
+		for (const [account, credential] of Object.entries(stored)) {
+			if (!isOAuthEntry(credential)) continue;
+			if (credential.expires > Date.now() + TOKEN_KEEPER_LEAD_MS) continue;
+			const baseProvider = baseProviderForAccount(account);
+			if (!baseProvider) continue;
+			await keepFreshCredential(account, baseProvider).catch(() => {});
+		}
+	};
+
+	tokenKeeperTimer = setInterval(() => void tick(), TOKEN_KEEPER_INTERVAL_MS);
+	tokenKeeperTimer.unref?.();
+	void tick();
+}
+
+function stopTokenKeeper(): void {
+	if (!tokenKeeperTimer) return;
+	clearInterval(tokenKeeperTimer);
+	tokenKeeperTimer = undefined;
+}
+
 interface QuotaAccount {
 	providerName: string;
 	baseProvider: string;
@@ -2192,6 +2335,9 @@ interface MultiPassConfig {
 	/** Re-route pi's hardcoded /model to our labelled picker. Off by default;
 	 * replaces the TUI editor so other extensions can't own it concurrently. */
 	interceptModel?: boolean;
+	/** Renew OAuth tokens ahead of pi and persist every rotation. Off by
+	 * default; takes over refreshes pi would otherwise do itself. */
+	tokenKeeper?: boolean;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -2239,6 +2385,7 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
 		statusBar: parsed.statusBar === true,
 		interceptModel: parsed.interceptModel === true,
+		tokenKeeper: parsed.tokenKeeper === true,
 	};
 }
 
@@ -2658,6 +2805,13 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const oauth = template.buildOAuth
 		? { ...template.buildOAuth(entry.index), name: subDisplayName(entry) }
 		: undefined;
+	if (oauth) {
+		const defaultRefresh = oauth.refreshToken;
+		oauth.refreshToken = (credentials: OAuthCredentials, signal?: AbortSignal) =>
+			isTokenKeeperEnabled()
+				? keepFreshCredential(name, entry.provider, credentials)
+				: defaultRefresh(credentials, signal);
+	}
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
@@ -6553,12 +6707,7 @@ async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
 
 async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
 	validateBundle(bundle);
-	const authPath = join(getAgentDir(), "auth.json");
-	mkdirSync(dirname(authPath), { recursive: true, mode: 0o700 });
-	if (!existsSync(authPath)) writeFileSync(authPath, "{}", { mode: 0o600 });
-	const release = await lockfile.lock(authPath, { realpath: false, retries: { retries: 10, minTimeout: 50 } });
-	try {
-		const stored = JSON.parse(readFileSync(authPath, "utf-8"));
+	return withAuthFile((stored) => {
 		const config = loadGlobalConfig();
 		const added: string[] = [];
 		for (const item of bundle.accounts) {
@@ -6572,9 +6721,8 @@ async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
 		}
 		// Save config before auth: an auth write failure leaves harmless unauthed entries.
 		saveGlobalConfig(config);
-		writeFileSync(authPath, JSON.stringify(stored, null, 2), { mode: 0o600 });
-		return added;
-	} finally { await release(); }
+		return { value: added, changed: true };
+	});
 }
 
 async function handleSubsReceive(ctx: ExtensionCommandContext): Promise<void> {
@@ -6631,6 +6779,7 @@ async function handleSubsMenu(
 		{ value: "receive", label: "receive", description: "Import offline QR frames from another pi" },
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
 		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
+		{ value: "keeper", label: "keeper", description: "Toggle shared OAuth token keeper for parallel pi sessions" },
 	];
 	let preferredAction = "list";
 
@@ -6685,6 +6834,9 @@ async function handleSubsMenu(
 				break;
 			case "intercept-model":
 				await handleSubsInterceptModel(ctx, pi);
+				break;
+			case "keeper":
+				await handleSubsKeeper(ctx);
 				break;
 		}
 	}
@@ -7258,6 +7410,20 @@ async function handleSubsInterceptModel(
 	);
 }
 
+async function handleSubsKeeper(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	config.tokenKeeper = !config.tokenKeeper;
+	saveGlobalConfig(config);
+	if (config.tokenKeeper) startTokenKeeper();
+	else stopTokenKeeper();
+	ctx.ui.notify(
+		config.tokenKeeper
+			? "multi-pass token keeper enabled: OAuth refreshes run once per machine (/subs keeper to disable)"
+			: "multi-pass token keeper disabled, pi refreshes tokens itself again",
+		"info",
+	);
+}
+
 async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	config.statusBar = !config.statusBar;
@@ -7276,6 +7442,8 @@ async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> 
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
+	startTokenKeeper();
+
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -7453,7 +7621,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model", "keeper"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7498,6 +7666,9 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "statusbar":
 				case "bar":
 					return handleSubsStatusbar(ctx);
+				case "keeper":
+				case "tokenkeeper":
+					return handleSubsKeeper(ctx);
 				case "intercept-model":
 				case "intercept":
 					return handleSubsInterceptModel(ctx, pi);
