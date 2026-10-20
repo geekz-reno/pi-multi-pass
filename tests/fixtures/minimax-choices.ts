@@ -44,7 +44,8 @@ export default function (pi) {
 			const run = (name, args, extra = {}) => commands.get(name).handler(args, context(extra));
 			const requests = [];
 			const fetch = async (url, init) => {
-				assert.match(String(url), /^https:\/\/api\.(minimax\.io|minimaxi\.com)\/anthropic\/v1\/messages$/);
+				// pi may append query parameters to the endpoint (e.g. ?beta=true).
+				assert.match(String(url), /^https:\/\/api\.(minimax\.io|minimaxi\.com)\/anthropic\/v1\/messages(\?.*)?$/);
 				requests.push({ url: String(url), body: JSON.parse(init.body) });
 				const events = [
 					{ type: "message_start", message: { id: "offline", type: "message", role: "assistant", model: requests.at(-1).body.model, content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
