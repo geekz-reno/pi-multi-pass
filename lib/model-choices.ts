@@ -52,8 +52,15 @@ export function ordinaryModelChoices(
 	isCatalogModel: (model: Model<Api>) => boolean,
 	current?: Pick<Model<Api>, "provider" | "id">,
 ): Model<Api>[] {
+	// Nothing to prefer on a host whose catalog predates the preferred models;
+	// hiding legacy entries there would leave the provider with no choices at all.
+	const preferredProviders = new Set(
+		models.filter((model) => MINIMAX_TEXT_CHOICES.some((id) => id === model.id))
+			.map((model) => model.provider),
+	);
 	return models.filter((model) =>
 		!minimaxBase(model.provider)
+		|| !preferredProviders.has(model.provider)
 		|| !model.input.includes("text")
 		|| MINIMAX_TEXT_CHOICES.some((id) => id === model.id)
 		|| (current?.provider === model.provider && current.id === model.id)

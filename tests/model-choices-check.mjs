@@ -14,6 +14,13 @@ assert.deepEqual(ordinaryModelChoices(all, (candidate) => catalog.includes(candi
 	["MiniMax-M3.1-Flash", "MiniMax-M3", "speech-02-hd", "MiniMax-M2.7", "my-model"]);
 assert.ok(ordinaryModelChoices(all, () => true, legacy).includes(legacy));
 assert.ok(ordinaryModelChoices([legacy], () => false).includes(legacy));
+// A host catalog without any preferred model has nothing to prefer.
+assert.deepEqual(ordinaryModelChoices([legacy, model("MiniMax-M2.5")], () => true).map((m) => m.id),
+	["MiniMax-M2.7", "MiniMax-M2.5"]);
+// Preference is per provider: a sub without a preferred model keeps its catalog.
+const perProvider = [model("MiniMax-M3", { provider: "minimax-2" }), model("MiniMax-M2.5", { provider: "minimax-cn-3" })];
+assert.deepEqual(ordinaryModelChoices(perProvider, () => true).map((m) => `${m.provider}/${m.id}`),
+	["minimax-2/MiniMax-M3", "minimax-cn-3/MiniMax-M2.5"]);
 assert.equal(configuredModelOverride({ providers: { minimax: { models: [legacy] } } }, "minimax", legacy.id), true);
 assert.equal(configuredModelOverride({ providers: { minimax: { modelOverrides: { [legacy.id]: {} } } } }, "minimax", legacy.id), true);
 assert.equal(configuredModelOverride({ providers: { minimax: { baseUrl: "https://custom.invalid" } } }, "minimax", legacy.id), true);
