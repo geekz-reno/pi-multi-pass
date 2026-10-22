@@ -24,9 +24,9 @@ assert.match(source, /AbortSignal\.timeout\(TOKEN_REFRESH_TIMEOUT_MS\)/);
 assert.ok(/TOKEN_REFRESH_TIMEOUT_MS = 25_000/.test(source));
 
 // Opt-in only: without the config flag nothing changes for other setups.
-assert.match(source, /function isTokenKeeperEnabled\(\): boolean \{\n\treturn loadGlobalConfig\(\)\.tokenKeeper === true;/);
+assert.match(source, /function isTokenKeeperEnabled\(\): boolean \{\n\treturn !isOmp && loadGlobalConfig\(\)\.tokenKeeper === true;/);
 assert.match(source, /tokenKeeper: parsed\.tokenKeeper === true,/);
-assert.match(source, /if \(tokenKeeperTimer \|\| !isTokenKeeperEnabled\(\)\) return;/);
+assert.match(source, /if \(isOmp \|\| tokenKeeperTimer \|\| !isTokenKeeperEnabled\(\)\) return;/);
 assert.match(
 	source,
 	/isTokenKeeperEnabled\(\)\n\t\t\t\t\? keepFreshCredential\(name, entry\.provider, credentials\)\n\t\t\t\t: defaultRefresh\(credentials, signal\);/,

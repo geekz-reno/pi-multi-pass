@@ -1,5 +1,5 @@
 /**
- * Multi-Subscription extension for pi.
+ * Multi-Subscription extension for Pi and OMP.
  *
  * Register additional OAuth subscription accounts for any supported provider.
  * Each extra account gets its own provider name, /login entry, and cloned models.
@@ -56,19 +56,22 @@ import type {
 	AgentEndEvent,
 	ReadonlyFooterDataProvider,
 } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+	isOmp,
+	projectConfigDir,
+	setModelRegistry,
+	ompAuth,
+	oauthProvider,
+	builtinProviders,
+	getModels,
 	BorderedLoader,
 	CustomEditor,
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
 	readStoredCredential,
-	type Theme,
-} from "@earendil-works/pi-coding-agent";
-import {
-	builtinProviders,
-	getBuiltinModels as getModels,
-} from "@earendil-works/pi-ai/providers/all";
+} from "../lib/host.ts";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
@@ -204,6 +207,7 @@ function flowBackedOAuth(
 	name: string,
 	options?: { usesCallbackServer?: boolean },
 ): Omit<OAuthProviderInterface, "id"> {
+	if (isOmp) return { name, ...oauthProvider(providerId) };
 	// Mirror the built-in flow's subscription flag so extra accounts light up
 	// pi's subscription handling (e.g. the footer indicator via
 	// modelRuntime.isUsingSubscription). Guarded: providers without a flow in
@@ -393,6 +397,14 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 		runtime?: { logout(provider: string): Promise<void> };
 		getProviderAuthStatus(provider: string): { configured: boolean };
 	};
+	if (isOmp) {
+		const auth = (registry.authStorage ?? ompAuth) as any;
+		return {
+			hasAuth: (provider) => auth.keys.source(provider) !== undefined || auth.keys.keyless(provider),
+			get: (provider) => auth.credentials.get(provider),
+			logout: (provider) => auth.credentials.remove(provider),
+		};
+	}
 	if (registry.authStorage) return registry.authStorage;
 
 	return {
@@ -425,6 +437,8 @@ function getAuthFilePath(): string {
 }
 
 function readAuthFile(path = getAuthFilePath()): AuthFile {
+	if (isOmp) return Object.fromEntries(Object.entries(ompAuth.credentials.all())
+		.map(([provider, credential]) => [provider, Array.isArray(credential) ? credential[0] : credential]));
 	if (!existsSync(path)) return {};
 	const parsed = JSON.parse(readFileSync(path, "utf-8"));
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -440,14 +454,20 @@ function readAuthFile(path = getAuthFilePath()): AuthFile {
 async function withAuthFile<T>(
 	edit: (stored: AuthFile) => Promise<{ value: T; changed?: boolean }> | { value: T; changed?: boolean },
 ): Promise<T> {
-	const path = getAuthFilePath();
+	const path = isOmp ? join(getAgentDir(), "multi-pass-auth") : getAuthFilePath();
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	if (!existsSync(path)) writeFileSync(path, "{}", { mode: 0o600 });
 	const release = await lockfile.lock(path, { realpath: false, retries: { retries: 10, minTimeout: 50 } });
 	try {
+		if (isOmp) await ompAuth.credentials.reload();
 		const stored = readAuthFile(path);
+		const previous = { ...stored };
 		const { value, changed } = await edit(stored);
-		if (changed) writeFileSync(path, JSON.stringify(stored, null, 2), { mode: 0o600 });
+		if (changed && isOmp) {
+			for (const [provider, credential] of Object.entries(stored)) {
+				if (credential !== previous[provider]) await ompAuth.credentials.set(provider, credential);
+			}
+		} else if (changed) writeFileSync(path, JSON.stringify(stored, null, 2), { mode: 0o600 });
 		return value;
 	} finally {
 		await release();
@@ -484,6 +504,18 @@ function keepFreshCredential(
 	baseProvider: string,
 	hint?: OAuthCredentials,
 ): Promise<OAuthCredentials> {
+	if (isOmp) {
+		return ompAuth.oauth.refreshStored(account, {
+			observedCredential: hint && asOAuthCredential(hint),
+			credentialFromRow: (credential: AuthStorageEntry) => isOAuthEntry(credential) ? credential : undefined,
+			refreshSkewMs: AUTH_REFRESH_SKEW_MS,
+			refreshTimeoutMs: TOKEN_REFRESH_TIMEOUT_MS,
+			refresh: oauthProvider(baseProvider)!.refreshToken,
+		}).then(({ credential }: any) => {
+			if (!credential) throw new Error(`No refresh token stored for ${account}`);
+			return credential;
+		});
+	}
 	const inFlight = refreshesInFlight.get(account);
 	if (inFlight) return inFlight;
 
@@ -512,7 +544,7 @@ let tokenKeeperTimer: ReturnType<typeof setInterval> | undefined;
 
 /** Opt-in: `"tokenKeeper": true` in ~/.pi/agent/multi-pass.json, or /subs keeper. */
 function isTokenKeeperEnabled(): boolean {
-	return loadGlobalConfig().tokenKeeper === true;
+	return !isOmp && loadGlobalConfig().tokenKeeper === true;
 }
 
 /**
@@ -521,7 +553,7 @@ function isTokenKeeperEnabled(): boolean {
  * Covers built-in logins too, which pi otherwise refreshes per process.
  */
 function startTokenKeeper(): void {
-	if (tokenKeeperTimer || !isTokenKeeperEnabled()) return;
+	if (isOmp || tokenKeeperTimer || !isTokenKeeperEnabled()) return;
 
 	const tick = async (): Promise<void> => {
 		let stored: AuthFile;
@@ -2370,7 +2402,7 @@ function globalConfigPath(): string {
 }
 
 function projectConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "multi-pass.json");
+	return join(cwd, projectConfigDir, "multi-pass.json");
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
@@ -2736,6 +2768,7 @@ function cloneModels(originalProvider: string, index: number, entry?: SubEntry) 
 		name: entry ? subModelName(entry, m.name) : `${m.name} (#${index})`,
 		api: m.api,
 		reasoning: m.reasoning,
+		...(isOmp ? { thinking: (m as any).thinking, preferWebsockets: (m as any).preferWebsockets } : {}),
 		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
 		input: m.input as ("text" | "image")[],
 		cost: { ...m.cost },
@@ -2877,10 +2910,12 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 		name: subDisplayName(entry),
 		baseUrl,
 		api: builtinModels[0]?.api,
-		apiKey: template.apiKey,
+		apiKey: isOmp ? template.apiKey?.replace(/^\$/, "") : template.apiKey,
 		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
-		refreshModels: async () => liveSubscriptionModels(entry, name),
+		...(isOmp
+			? { fetchDynamicModels: async () => liveSubscriptionModels(entry, name) }
+			: { refreshModels: async () => liveSubscriptionModels(entry, name) }),
 	};
 	subscriptionRegistrations.set(name, registration);
 	pi.registerProvider(name, registration);
@@ -3700,6 +3735,7 @@ class PoolManager {
 		ctx: ExtensionContext,
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
+		hostWillRetry?: boolean,
 	): Promise<boolean> {
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
@@ -3789,12 +3825,13 @@ class PoolManager {
 			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
 		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
-		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
+		const willRetry = hostWillRetry ?? piWillRetryTurn(errorMessage);
+		if (lastUserPrompt && !willRetry) {
 			this.suppressNextStartTurn = true;
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
-			this.recordTrace("queued follow-up because pi will not retry this error");
-		} else if (piWillRetryTurn(errorMessage)) {
-			this.recordTrace("waiting for pi to retry the turn");
+			this.recordTrace("queued follow-up because the host will not retry this error");
+		} else if (willRetry) {
+			this.recordTrace("waiting for the host to retry the turn");
 		} else {
 			this.recordTrace("turn cannot be replayed because no prompt was captured");
 		}
@@ -4211,7 +4248,7 @@ async function renameSubscriptionLabel(
 	}
 
 	registerSub(pi, entry);
-	ctx.modelRegistry.refresh();
+	await ctx.modelRegistry.refresh();
 
 	ctx.ui.notify(`Updated ${previousName} -> ${nextName}`, "info");
 }
@@ -4252,7 +4289,7 @@ async function removeSubscriptionEntry(
 	);
 
 	saveGlobalConfig(config);
-	ctx.modelRegistry.refresh();
+	await ctx.modelRegistry.refresh();
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
 }
@@ -4666,7 +4703,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	saveGlobalConfig(config);
 
 	registerSub(pi, entry);
-	ctx.modelRegistry.refresh();
+	await ctx.modelRegistry.refresh();
 
 	const loginNow = await ctx.ui.confirm(
 		subDisplayName(entry),
@@ -5296,7 +5333,7 @@ async function promptForPoolDefinition(
 	if (strategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			`e.g. selectors/my-pool.js (relative to ${getAgentDir()}/)`,
 		);
 		if (scriptPath?.trim()) {
 			selectorScript = scriptPath.trim();
@@ -5571,7 +5608,7 @@ async function changePoolStrategy(
 	} else if (nextStrategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			`e.g. selectors/my-pool.js (relative to ${getAgentDir()}/)`,
 		);
 		if (!scriptPath?.trim()) {
 			ctx.ui.notify("No script path provided. Reverting to round-robin.", "warning");
@@ -6688,7 +6725,7 @@ async function handlePoolMenu(
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
 		"trace    -- Opt-in routing decision trace",
-		"project  -- Project-level pool config (.pi/multi-pass.json)",
+		`project  -- Project-level pool config (${projectConfigDir}/multi-pass.json)`,
 	];
 
 	const selected = await ctx.ui.select("Pool Manager", actions);
@@ -6827,7 +6864,7 @@ async function handleSubsReceive(ctx: ExtensionCommandContext): Promise<void> {
 		const account = bundle.accounts[0];
 		if (!(await ctx.ui.confirm("Import OAuth credentials?", `Import ${account.providerName} from ${count === 1 ? "the export string" : `${count} QR frames`}? The sender keeps its copy; token refresh on either device may invalidate the other.`))) return;
 		const added = await importShareBundle(bundle);
-		ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscription.`, "info");
+		ctx.ui.notify(`Imported: ${added.join(", ")}. Restart ${isOmp ? "OMP" : "pi"} to register the new subscription.`, "info");
 	} catch (error) {
 		ctx.ui.notify(`Receive failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
@@ -7316,7 +7353,7 @@ function renderStatusBarLine(
 				: "\u2026";
 		const text = `${account.glyph} ${account.shortName} ${status}`;
 		if (ctx.model?.provider === account.providerName) {
-			segments.push(theme.style(text, { fg: "accent", bold: true }));
+			segments.push(isOmp ? theme.bold(theme.fg("accent", text)) : theme.style(text, { fg: "accent", bold: true }));
 		} else {
 			const color = quota && quota.kind !== "missing-auth" && quota.kind !== "error"
 				? quotaBarColor(percent)
@@ -7393,7 +7430,11 @@ function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled
 		return;
 	}
 	ctx.ui.setFooter((tui, theme, footerData) =>
-		createStatusBarComponent(tui, theme, footerData, ctx),
+		createStatusBarComponent(tui, theme, footerData ?? {
+			getGitBranch: () => undefined,
+			onBranchChange: () => () => {},
+			getExtensionStatuses: () => new Map(),
+		} as ReadonlyFooterDataProvider, ctx),
 	);
 }
 
@@ -7490,6 +7531,10 @@ async function handleSubsInterceptModel(
 }
 
 async function handleSubsKeeper(ctx: ExtensionCommandContext): Promise<void> {
+	if (isOmp) {
+		ctx.ui.notify("OMP manages OAuth refresh ownership through its credential store; the Pi token keeper is not needed.", "info");
+		return;
+	}
 	const config = loadGlobalConfig();
 	config.tokenKeeper = !config.tokenKeeper;
 	saveGlobalConfig(config);
@@ -7580,6 +7625,7 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		setModelRegistry(ctx.modelRegistry);
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -7675,6 +7721,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				chains: effective.chains,
 				presets: effective.presets,
 			}),
+			isOmp ? (event as AgentEndEvent & { willContinue?: boolean }).willContinue === true : undefined,
 		);
 
 		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {

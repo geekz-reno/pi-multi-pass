@@ -1,7 +1,7 @@
 {
   "name": "pi-multi-pass",
   "version": "1.12.0",
-  "description": "Multi-subscription extension for pi -- use multiple OAuth accounts per provider (Anthropic, Codex, Copilot, Gemini, Antigravity)",
+  "description": "Multi-subscription extension for Pi and OMP -- multiple OAuth accounts with rate-limit rotation",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -37,5 +37,13 @@
     "@types/proper-lockfile": "^4.1.4",
     "@types/qrcode-terminal": "^0.12.2",
     "typescript": "^7.0.2"
+  },
+  "omp": {
+    "extensions": [
+      "./extensions/multi-sub.ts"
+    ]
+  },
+  "scripts": {
+    "test:omp": "node tests/omp-compat-check.mjs"
   }
 }

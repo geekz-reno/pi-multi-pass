@@ -2,28 +2,102 @@
   <img src="docs/header-v2.svg" alt="pi-multi-pass" width="800"/>
 </p>
 
+<h1 align="center">pi-multi-pass · Pi + Oh My Pi (OMP)</h1>
+
 <p align="center">
   <em>leeloo dallas. multi-pass.</em>
 </p>
 
 <p align="center">
-  Multi-subscription extension for <a href="https://github.com/earendil-works/pi">pi</a> -- use multiple OAuth
-  accounts per provider with automatic rate-limit rotation and project-level affinity.
+  Multi-subscription extension for <a href="https://github.com/earendil-works/pi">Pi</a>
+  and <a href="https://github.com/can1357/oh-my-pi">Oh My Pi (OMP)</a>.
+  Use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 </p>
 
 ---
 
-## Install
+This fork adds OMP compatibility to [hjanuschka/pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass)
+while retaining the existing Pi integration. **OMP compatibility is tested with version 18.12.6.**
+
+## Install with OMP
+
+Use this fork's checkout to get the OMP adapter:
 
 ```bash
-pi install npm:pi-multi-pass
+git clone https://github.com/geekz-reno/pi-multi-pass.git
+cd pi-multi-pass
+npm ci --omit=dev --ignore-scripts
+omp install "$PWD"
 ```
 
-Or via git:
+If you already cloned the repository, run the last two commands from its root.
+Start a new OMP session after installation. To try the extension for a single
+session without installing it globally, run this from the repository root:
 
 ```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+omp -e "$PWD/extensions/multi-sub.ts"
 ```
+
+Inside OMP:
+
+```text
+/subs add       Add another provider account
+/login          Authenticate the new account
+/pool create    Group accounts for automatic rate-limit rotation
+```
+
+The `/subs`, `/pool`, and `/mp-preset` commands are available through the same
+extension in Pi and OMP.
+
+## Install with Pi
+
+Install this fork with Pi's package manager:
+
+```bash
+pi install git:github.com/geekz-reno/pi-multi-pass
+```
+
+The original upstream Pi package is also available with `pi install npm:pi-multi-pass`.
+Use this fork's checkout for the OMP changes described here.
+
+## Pi and OMP configuration
+
+| Setting | Pi | OMP |
+|---|---|---|
+| Global multi-pass config | `~/.pi/agent/multi-pass.json` | `~/.omp/agent/multi-pass.json` |
+| Project multi-pass config | `.pi/multi-pass.json` | `.omp/multi-pass.json` |
+| Credential storage | Pi's `auth.json` | OMP's native SQLite/broker store |
+| Extra OAuth token keeper | Optional `/subs keeper` | OMP manages refresh ownership |
+
+OMP profiles and host agent-directory overrides select the corresponding global
+config directory. The detailed examples below use Pi paths; substitute the OMP
+paths when using OMP. Existing Pi logins are not migrated automatically. Log in
+through the host where you intend to use each account.
+
+The OMP adapter uses the host's OAuth login callbacks, structured credentials,
+and model catalog. Credentials remain in OMP's native store; multi-pass does not
+create an OMP `auth.json` mirror. Concurrent refreshes use OMP's durable refresh
+ownership instead of the separate Pi token keeper.
+
+After a rate limit, multi-pass respects OMP's `willContinue` signal: it leaves
+pending host retries alone and replays the captured prompt when the host has
+stopped. The optional custom status bar works with OMP's two-argument footer
+API; Pi-only branch/status metadata is omitted there.
+
+## Validate OMP compatibility
+
+With OMP installed and the runtime dependencies installed, run:
+
+```bash
+npm run test:omp
+```
+
+These integration checks use isolated configuration and dummy credentials,
+disable outbound fetches, and cover provider registration, OAuth callback
+wiring, durable refresh, project restrictions, failover, credential import,
+and logout. Interactive OAuth login and paid model requests require your own
+accounts and are not performed by the checks. Pi's existing integration tests
+require a separate Pi installation.
 
 ## Features
 
