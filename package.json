@@ -44,6 +44,7 @@
     ]
   },
   "scripts": {
-    "test:omp": "node tests/omp-compat-check.mjs"
+    "test:omp": "node tests/omp-compat-check.mjs",
+    "test:features": "node tests/routing-insights-check.mjs && node tests/review-regressions-check.mjs && node tests/features-check.mjs && node tests/headroom-integration-check.mjs"
   }
 }

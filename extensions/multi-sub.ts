@@ -47,6 +47,7 @@ import { homedir } from "os";
 import lockfile from "proper-lockfile";
 import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
 import { configuredModelOverride, matchesCatalogModel, mergeCatalog, minimaxBase, minimaxChoiceRank, ordinaryModelChoices, type CatalogEntry } from "../lib/model-choices.ts";
+import { addUsage, parseCooldownMs, validateRoutingConfig, weightedNextMember, type AccountUsage } from "../lib/routing-insights.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -373,7 +374,7 @@ const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_PROFILE_ENDPOINT = "https://api.anthropic.com/api/oauth/profile";
 const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
 
-type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth";
+type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth" | "pending-selection";
 
 interface AuthStorageEntry {
 	type?: string;
@@ -401,7 +402,19 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 		const auth = (registry.authStorage ?? ompAuth) as any;
 		return {
 			hasAuth: (provider) => auth.keys.source(provider) !== undefined || auth.keys.keyless(provider),
-			get: (provider) => auth.credentials.get(provider),
+			get: (provider) => {
+				// OMP's raw get() returns the first saved credential, while model
+				// requests use the account pinned to this session.
+				const sessionId = ctx.sessionManager?.getSessionId();
+				const selected = sessionId ? auth.sessions.get(provider, sessionId) : undefined;
+				if (selected?.credentialId !== undefined) {
+					const entry = auth.credentials.list(provider).find(
+						(candidate: { id: number }) => candidate.id === selected.credentialId,
+					);
+					if (entry) return entry.credential;
+				}
+				return auth.credentials.get(provider);
+			},
 			logout: (provider) => auth.credentials.remove(provider),
 		};
 	}
@@ -503,12 +516,13 @@ function keepFreshCredential(
 	account: string,
 	baseProvider: string,
 	hint?: OAuthCredentials,
+	refreshSkewMs = AUTH_REFRESH_SKEW_MS,
 ): Promise<OAuthCredentials> {
 	if (isOmp) {
 		return ompAuth.oauth.refreshStored(account, {
 			observedCredential: hint && asOAuthCredential(hint),
 			credentialFromRow: (credential: AuthStorageEntry) => isOAuthEntry(credential) ? credential : undefined,
-			refreshSkewMs: AUTH_REFRESH_SKEW_MS,
+			refreshSkewMs,
 			refreshTimeoutMs: TOKEN_REFRESH_TIMEOUT_MS,
 			refresh: oauthProvider(baseProvider)!.refreshToken,
 		}).then(({ credential }: any) => {
@@ -521,7 +535,7 @@ function keepFreshCredential(
 
 	const run = withAuthFile(async (stored) => {
 		const current = stored[account];
-		if (isOAuthEntry(current) && current.expires > Date.now() + AUTH_REFRESH_SKEW_MS) {
+		if (isOAuthEntry(current) && current.expires > Date.now() + refreshSkewMs) {
 			return { value: current as unknown as OAuthCredentials };
 		}
 		const credential = isOAuthEntry(current) ? current : hint;
@@ -567,7 +581,7 @@ function startTokenKeeper(): void {
 			if (credential.expires > Date.now() + TOKEN_KEEPER_LEAD_MS) continue;
 			const baseProvider = baseProviderForAccount(account);
 			if (!baseProvider) continue;
-			await keepFreshCredential(account, baseProvider).catch(() => {});
+			await keepFreshCredential(account, baseProvider, undefined, TOKEN_KEEPER_LEAD_MS).catch(() => {});
 		}
 	};
 
@@ -587,6 +601,7 @@ interface QuotaAccount {
 	baseProvider: string;
 	displayName: string;
 	auth?: AuthStorageEntry;
+	pendingSelection?: boolean;
 }
 
 /** Structured quota window used by the card renderer. */
@@ -649,8 +664,7 @@ interface AnthropicUsageSnapshot {
 interface CodexUsageSnapshot {
 	planType: string;
 	email: string;
-	fiveHour?: CodexUsageWindow;
-	weekly?: CodexUsageWindow;
+	windows: CodexUsageWindow[];
 }
 
 interface GoogleGeminiQuotaResponse {
@@ -721,8 +735,10 @@ function getCodexTokenMetadata(accessToken: string): {
 function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefined {
 	const raw = getRecord(window);
 	if (!raw) return undefined;
-	const usedPercent = typeof raw.used_percent === "number" ? raw.used_percent : 0;
-	const windowSeconds = typeof raw.limit_window_seconds === "number" ? raw.limit_window_seconds : 0;
+	const usedPercent = raw.used_percent;
+	const windowSeconds = raw.limit_window_seconds;
+	if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)
+		|| typeof windowSeconds !== "number" || !Number.isFinite(windowSeconds) || windowSeconds <= 0) return undefined;
 	const resetAt = typeof raw.reset_at === "number" ? raw.reset_at : undefined;
 	return {
 		usedPercent,
@@ -736,20 +752,28 @@ function matchesUsageWindow(window: CodexUsageWindow | undefined, expectedSecond
 	return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
 }
 
+function codexWindowLabel(window: CodexUsageWindow): string {
+	if (matchesUsageWindow(window, 5 * 60 * 60)) return "5h";
+	if (matchesUsageWindow(window, 7 * 24 * 60 * 60)) return "7d";
+	const seconds = window.windowSeconds;
+	if (seconds % 86400 === 0) return `${seconds / 86400}d`;
+	if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+	if (seconds % 60 === 0) return `${seconds / 60}m`;
+	return `${seconds}s`;
+}
+
 function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 	const raw = getRecord(data);
 	const rateLimit = getRecord(raw?.rate_limit);
 	const windows = [
 		normalizeCodexUsageWindow(rateLimit?.primary_window),
 		normalizeCodexUsageWindow(rateLimit?.secondary_window),
-	].filter((window): window is CodexUsageWindow => Boolean(window));
-	const fiveHour = windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60));
-	const weekly = windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60));
+	].filter((window): window is CodexUsageWindow => Boolean(window))
+		.sort((a, b) => a.windowSeconds - b.windowSeconds);
 	return {
 		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
 		email: typeof raw?.email === "string" ? raw.email : "",
-		fiveHour,
-		weekly,
+		windows,
 	};
 }
 
@@ -840,9 +864,7 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 	kind: QuotaStatusKind;
 	score: number;
 } {
-	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
-	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
-	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
+	const values = snapshot.windows.map(getCodexWindowRemaining).filter((value): value is number => value !== undefined);
 	if (values.length === 0) {
 		return { kind: "error", score: 0 };
 	}
@@ -865,6 +887,8 @@ function formatQuotaKind(kind: QuotaStatusKind): string {
 			return "blocked";
 		case "missing-auth":
 			return "not logged in";
+		case "pending-selection":
+			return "waiting for account";
 		default:
 			return "error";
 	}
@@ -885,6 +909,8 @@ function compareQuotaResults(left: QuotaCheckResult, right: QuotaCheckResult): n
 				return 4;
 			case "missing-auth":
 				return 5;
+			case "pending-selection":
+				return 6;
 		}
 	};
 	return rank(left.kind) - rank(right.kind)
@@ -904,6 +930,8 @@ function getQuotaStatusGlyph(kind: QuotaStatusKind): string {
 			return "✕";
 		case "missing-auth":
 			return "○";
+		case "pending-selection":
+			return "…";
 		default:
 			return "?";
 	}
@@ -917,6 +945,7 @@ function formatQuotaOverview(results: QuotaCheckResult[]): string {
 		blocked: 0,
 		error: 0,
 		missingAuth: 0,
+		pending: 0,
 	};
 
 	for (const result of results) {
@@ -936,6 +965,9 @@ function formatQuotaOverview(results: QuotaCheckResult[]): string {
 			case "missing-auth":
 				counts.missingAuth++;
 				break;
+			case "pending-selection":
+				counts.pending++;
+				break;
 			default:
 				counts.error++;
 		}
@@ -948,6 +980,7 @@ function formatQuotaOverview(results: QuotaCheckResult[]): string {
 	if (counts.blocked > 0) parts.push(`${counts.blocked} blocked`);
 	if (counts.error > 0) parts.push(`${counts.error} error`);
 	if (counts.missingAuth > 0) parts.push(`${counts.missingAuth} not logged in`);
+	if (counts.pending > 0) parts.push(`${counts.pending} waiting for account`);
 
 	const best = results[0];
 	if (best) {
@@ -1093,16 +1126,50 @@ async function showWrappedSelect(
 	return selectedValue ?? undefined;
 }
 
+const QUOTA_CHECK_TIMEOUT_MS = 10_000;
+
 async function runQuotaChecks(
 	accounts: QuotaAccount[],
 	signal?: AbortSignal,
 ): Promise<QuotaCheckResult[]> {
+	const deadline = AbortSignal.timeout(QUOTA_CHECK_TIMEOUT_MS);
+	const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
 	const results = await Promise.all(accounts.map(async (account) => {
+		if (account.pendingSelection) return {
+			account,
+			kind: "pending-selection" as const,
+			summary: "waiting for OMP account selection",
+			details: ["OMP has multiple saved logins for this provider and has not selected one for this session yet."],
+			score: 0,
+		};
 		const checker = PROVIDER_QUOTA_CHECKERS.find(
 			(candidate) => candidate.baseProvider === account.baseProvider,
 		);
 		if (!checker) return undefined;
-		return checker.check(account, signal);
+		let onAbort: (() => void) | undefined;
+		try {
+			requestSignal.throwIfAborted();
+			const aborted = new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(requestSignal.reason);
+				requestSignal.addEventListener("abort", onAbort, { once: true });
+			});
+			// Bound the entire checker, including refresh implementations that do
+			// not observe cancellation. Late completions cannot replace this result.
+			return await Promise.race([
+				new Promise<QuotaCheckResult>((resolve) => resolve(checker.check(account, requestSignal))),
+				aborted,
+			]);
+		} catch (error) {
+			return {
+				account,
+				kind: "error" as const,
+				summary: requestSignal.aborted ? "quota check cancelled or timed out" : "quota check failed",
+				details: [error instanceof Error ? error.message : String(error)],
+				score: 0,
+			};
+		} finally {
+			if (onAbort) requestSignal.removeEventListener("abort", onAbort);
+		}
 	}));
 
 	return results
@@ -1323,17 +1390,16 @@ async function resolveGoogleQuotaAccess(
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		// pi-ai >= 0.84: use the built-in provider OAuth flow to refresh the
-		// access token instead of the removed refreshGoogleCloudToken helpers.
-		const flow = getBuiltinOAuthFlow(account.baseProvider);
-		const credentials = await flow.refresh(
+		const credentials = await keepFreshCredential(
+			account.providerName,
+			account.baseProvider,
 			asOAuthCredential({
+				...auth,
 				access: auth.access ?? "",
 				refresh: auth.refresh,
 				expires: auth.expires ?? 0,
 				projectId,
 			}),
-			new AbortController().signal,
 		) as GeminiCredentials;
 		return {
 			accessToken: credentials.access,
@@ -1589,11 +1655,22 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 		if (allowed && !allowed.has(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
+		let auth = getAuthStorage(ctx).get(providerName);
+		let pendingSelection = false;
+		if (isOmp) {
+			const native = (ctx.modelRegistry as any).authStorage ?? ompAuth;
+			const sessionId = ctx.sessionManager?.getSessionId();
+			const selected = sessionId ? native.sessions.get(providerName, sessionId) : undefined;
+			pendingSelection = !selected && native.credentials.list(providerName)
+				.filter((entry: { credential: AuthStorageEntry }) => entry.credential.type === "oauth").length > 1;
+			if (pendingSelection) auth = undefined;
+		}
 		accounts.push({
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
+			auth,
+			pendingSelection,
 		});
 	};
 
@@ -1876,14 +1953,18 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			if ((!snapshot.planType || snapshot.planType === "unknown") && tokenMetadata.planType) {
 				snapshot.planType = tokenMetadata.planType;
 			}
-			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
-			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+			const windows: QuotaDisplayWindow[] = snapshot.windows.map((window) => ({
+				label: codexWindowLabel(window),
+				remainingPercent: getCodexWindowRemaining(window),
+				resetAt: window.resetAt,
+			}));
 			const classification = classifyCodexQuotaKind(snapshot);
 			const resetCredits = parseCodexResetCredits(rawData);
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
-				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
-				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				...(windows.length > 0
+					? windows.map((window) => `${window.label} ${formatRemainingPercent(window.remainingPercent)} (${formatResetShort(window.resetAt)})`)
+					: ["no quota windows returned"]),
 				formatQuotaKind(classification.kind),
 			].join(" | ");
 			const details = [
@@ -1895,10 +1976,8 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			if (snapshot.email) {
 				details.push(`email: ${snapshot.email}`);
 			}
-			details.push(
-				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
-				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-			);
+			details.push(...windows.map((window) =>
+				`${window.label} window: ${formatRemainingPercent(window.remainingPercent)} left, resets ${formatResetLong(window.resetAt)}`));
 			if (resetCredits) {
 				const base = `${resetCredits.available} stored reset${resetCredits.available === 1 ? "" : "s"}`;
 				details.push(resetCredits.applicable > 0
@@ -1906,13 +1985,6 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 					: `reset credits: ${base}`);
 			}
 			details.push(`endpoint: ${baseUrl}/wham/usage`);
-			const windows: QuotaDisplayWindow[] = [];
-			if (snapshot.fiveHour) {
-				windows.push({ label: "5h", remainingPercent: fiveHourLeft, resetAt: snapshot.fiveHour.resetAt });
-			}
-			if (snapshot.weekly) {
-				windows.push({ label: "7d", remainingPercent: weeklyLeft, resetAt: snapshot.weekly.resetAt });
-			}
 			const remainingValues = windows
 				.map((w) => w.remainingPercent)
 				.filter((v): v is number => v !== undefined);
@@ -2240,15 +2312,18 @@ interface SubEntry {
 }
 
 /** Pool member selection strategy.
- *  - "round-robin": rotate sequentially through members (default).
- *  - "quota-first": query built-in quota checkers and prefer the member
+ *  - "round-robin": rotate sequentially on failover (default).
+ *  - "per-turn": advance to the next usable member before each new prompt;
+ *    retries retain their selected account, with round-robin failover.
+ *  - "quota-first": check all eligible members at session startup, then
+ *    query built-in quota checkers on failover and prefer the member
  *    with the most remaining quota. Falls back to round-robin when no
  *    quota data is available.
  *  - "scheduled": use per-member time-window schedules to pick the best
  *    member. Preferred members in their active window go first (shortest
  *    remaining window first), then default members, then overflow.
  *  - "custom": delegate selection to a user-provided JS script. */
-type PoolStrategy = "round-robin" | "quota-first" | "scheduled" | "custom";
+type PoolStrategy = "round-robin" | "per-turn" | "weighted" | "quota-first" | "scheduled" | "custom";
 
 type DayOfWeek = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 const ALL_DAYS: readonly DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
@@ -2328,9 +2403,11 @@ interface PoolConfig {
 	members: string[];
 	/** Whether auto-rotation is enabled */
 	enabled: boolean;
-	/** Selection strategy when picking the next member on failover.
+	/** Selection strategy for failover, or each new prompt with "per-turn".
 	 *  Defaults to "round-robin" when omitted. */
 	strategy?: PoolStrategy;
+	/** Relative request shares for the opt-in weighted strategy. Defaults to 1. */
+	memberWeights?: Record<string, number>;
 	/** Per-member schedule rules (keyed by provider name).
 	 *  Only used when strategy is "scheduled". */
 	memberSchedule?: Record<string, MemberSchedule>;
@@ -2409,13 +2486,25 @@ function emptyMultiPassConfig(): MultiPassConfig {
 	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
 
+function usablePool(raw: unknown): raw is PoolConfig {
+	const pool = getRecord(raw);
+	return !!pool && typeof pool.name === "string" && typeof pool.baseProvider === "string"
+		&& Array.isArray(pool.members) && pool.members.every(member => typeof member === "string");
+}
+
+function usableChain(raw: unknown): raw is ChainConfig {
+	const chain = getRecord(raw);
+	return !!chain && typeof chain.name === "string" && Array.isArray(chain.entries)
+		&& chain.entries.every(entry => !!getRecord(entry) && typeof entry.pool === "string" && typeof entry.model === "string");
+}
+
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<MultiPassConfig>) : {};
 	return {
-		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
-		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
-		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
-		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
+		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions.filter(entry => entry && typeof entry.provider === "string") : [],
+		pools: Array.isArray(parsed.pools) ? parsed.pools.filter(usablePool) : [],
+		chains: Array.isArray(parsed.chains) ? parsed.chains.filter(usableChain) : [],
+		presets: Array.isArray(parsed.presets) ? parsed.presets.filter(preset => preset && typeof preset.name === "string" && Array.isArray(preset.entries)) : [],
 		statusBar: parsed.statusBar === true,
 		interceptModel: parsed.interceptModel === true,
 		tokenKeeper: parsed.tokenKeeper === true,
@@ -2425,9 +2514,9 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 function normalizeProjectConfig(raw: unknown): ProjectConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<ProjectConfig>) : {};
 	const config: ProjectConfig = {};
-	if (Array.isArray(parsed.pools)) config.pools = parsed.pools;
-	if (Array.isArray(parsed.chains)) config.chains = parsed.chains;
-	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs;
+	if (Array.isArray(parsed.pools)) config.pools = parsed.pools.filter(usablePool);
+	if (Array.isArray(parsed.chains)) config.chains = parsed.chains.filter(usableChain);
+	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs.filter(value => typeof value === "string");
 	return config;
 }
 
@@ -3169,6 +3258,7 @@ interface PoolState {
 	currentIndex: number;
 	/** Members that are temporarily "exhausted" (hit limit), with timestamps */
 	exhausted: Map<string, number>;
+	retryAt: Map<string, number>;
 	/** Cooldown period in ms before retrying an exhausted member */
 	cooldownMs: number;
 }
@@ -3199,11 +3289,76 @@ class PoolManager {
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
 	private suppressNextStartTurn = false;
+	private hostContinuationPending = false;
+	private startupQuotaCheck?: Promise<void>;
+	private startupQuotaGeneration = 0;
 	private traceEnabled = false;
 	private routingTrace: RoutingTraceEntry[] = [];
+	private usage = new Map<string, AccountUsage>();
+	private recordedMessages = new WeakSet<object>();
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	resetUsage(): void {
+		this.usage.clear();
+		this.recordedMessages = new WeakSet<object>();
+	}
+
+	recordUsage(provider: string, message: object & { usage?: unknown }): void {
+		if (!provider || this.recordedMessages.has(message)) return;
+		this.recordedMessages.add(message);
+		this.usage.set(provider, addUsage(this.usage.get(provider), message.usage));
+	}
+
+	getUsage(): Record<string, AccountUsage> {
+		return Object.fromEntries([...this.usage].map(([provider, usage]) => [provider, { ...usage }]));
+	}
+
+	async preview(currentModel: Model<Api>, config: MultiPassConfig, ctx: ExtensionContext): Promise<string[]> {
+		const shadow = new PoolManager({} as ExtensionAPI);
+		shadow.loadPools(config.pools);
+		for (const [name, state] of this.poolStates) {
+			shadow.poolStates.set(name, { ...state, exhausted: new Map(state.exhausted), retryAt: new Map(state.retryAt) });
+		}
+		shadow.usage = new Map(this.usage);
+		const pool = shadow.getPoolForProvider(currentModel.provider);
+		const lines = [`Routing preview — ${currentModel.provider}/${currentModel.id}`, "No model switch, prompt, quota request, or selector script is run."];
+		if (!pool) return [...lines, "Current provider is not in an enabled pool."];
+		lines.push(`Pool: ${pool.name} · strategy: ${pool.strategy ?? "round-robin"}`);
+		const plan = shadow.buildFailoverPlan(currentModel, config, getAuthStorage(ctx));
+		if (pool.strategy !== "custom" && pool.strategy !== "quota-first") {
+			await shadow.reorderCandidatesByStrategy(pool, plan, currentModel, { ...ctx, ui: { ...ctx.ui, notify() {} } }, {
+				prompt: "", attemptedProviders: new Set(), visitedChainIndexes: new Set(),
+			}, null);
+		} else if (pool.strategy === "quota-first") {
+			const ranked = plan.candidates.filter(candidate => candidate.source === "pool");
+			ranked.sort((left, right) => {
+				const a = statusBarQuota.get(left.provider), b = statusBarQuota.get(right.provider);
+				return a && b ? compareQuotaResults(a, b) : a ? -1 : b ? 1 : 0;
+			});
+			plan.candidates = [...ranked, ...plan.candidates.filter(candidate => candidate.source !== "pool")];
+			lines.push("Quota order uses the last cached snapshot; live results may differ.");
+		} else {
+			lines.push("Custom selector is not executed; the listed order is its round-robin fallback.");
+		}
+		let nextPrompt = currentModel.provider;
+		if (pool.strategy === "per-turn") nextPrompt = plan.candidates.find(candidate => candidate.source === "pool" && ctx.modelRegistry.find(candidate.provider, currentModel.id))?.provider ?? nextPrompt;
+		if (pool.strategy === "weighted") {
+			const usable = shadow.getAvailableMembers(pool, getAuthStorage(ctx)).filter(provider => ctx.modelRegistry.find(provider, currentModel.id));
+			nextPrompt = weightedNextMember(pool.members, currentModel.provider, usable, pool.memberWeights ?? {}, this.getUsage()) ?? nextPrompt;
+		}
+		lines.push(`Next new prompt: ${nextPrompt}/${currentModel.id}`);
+		const candidates = plan.candidates.filter(candidate => ctx.modelRegistry.find(candidate.provider, candidate.modelId));
+		lines.push(...candidates.map((candidate, index) => `Failover ${index + 1}: ${candidate.provider}/${candidate.modelId} (${candidate.poolName})`));
+		if (!candidates.length) lines.push("No usable failover target.");
+		for (const member of pool.members) {
+			const remaining = shadow.getCooldownRemainingMs(member);
+			if (remaining) lines.push(`Cooldown: ${member} · ${Math.ceil(remaining / 1000)}s remaining`);
+		}
+		lines.push(...plan.skips.map(skip => `Skipped: ${skip.detail}`));
+		return lines;
 	}
 
 	startTrace(): void {
@@ -3241,6 +3396,7 @@ class PoolManager {
 			state = {
 				currentIndex: 0,
 				exhausted: new Map(),
+				retryAt: new Map(),
 				cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
 			};
 			this.poolStates.set(poolName, state);
@@ -3254,6 +3410,7 @@ class PoolManager {
 
 		const activePoolNames = new Set<string>();
 		for (const pool of configs) {
+			if (!pool || typeof pool.name !== "string" || !Array.isArray(pool.members)) continue;
 			if (!pool.enabled) continue;
 			activePoolNames.add(pool.name);
 			this.pools.set(pool.name, pool);
@@ -3263,6 +3420,7 @@ class PoolManager {
 			for (const member of Array.from(state.exhausted.keys())) {
 				if (!pool.members.includes(member)) {
 					state.exhausted.delete(member);
+					state.retryAt.delete(member);
 				}
 			}
 
@@ -3290,16 +3448,9 @@ class PoolManager {
 		pool: PoolConfig,
 		authStorage: { hasAuth(provider: string): boolean },
 	): string[] {
-		const state = this.getOrCreatePoolState(pool.name);
-		const now = Date.now();
 		return pool.members.filter((member) => {
 			if (!authStorage.hasAuth(member)) return false;
-			const exhaustedAt = state.exhausted.get(member);
-			if (exhaustedAt && now - exhaustedAt < state.cooldownMs) return false;
-			if (exhaustedAt && now - exhaustedAt >= state.cooldownMs) {
-				state.exhausted.delete(member);
-			}
-			return true;
+			return !this.isMemberExhausted(pool, member);
 		});
 	}
 
@@ -3307,11 +3458,19 @@ class PoolManager {
 		const state = this.getOrCreatePoolState(pool.name);
 		const exhaustedAt = state.exhausted.get(provider);
 		if (!exhaustedAt) return false;
-		if (Date.now() - exhaustedAt >= state.cooldownMs) {
+		if (Date.now() >= (state.retryAt.get(provider) ?? exhaustedAt + state.cooldownMs)) {
 			state.exhausted.delete(provider);
+			state.retryAt.delete(provider);
 			return false;
 		}
 		return true;
+	}
+
+	getCooldownRemainingMs(provider: string): number {
+		const pool = this.getPoolForProvider(provider);
+		if (!pool || !this.isMemberExhausted(pool, provider)) return 0;
+		const state = this.getOrCreatePoolState(pool.name);
+		return Math.max(0, (state.retryAt.get(provider) ?? state.exhausted.get(provider)! + state.cooldownMs) - Date.now());
 	}
 
 	getEnabledChains(config: MultiPassConfig): ChainConfig[] {
@@ -3476,11 +3635,13 @@ class PoolManager {
 	}
 
 	/** Mark a member as exhausted (hit rate limit) */
-	markExhausted(providerName: string): void {
+	markExhausted(providerName: string, errorMessage = "", resetAtSeconds?: number): void {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
-		state.exhausted.set(providerName, Date.now());
+		const now = Date.now();
+		state.exhausted.set(providerName, now);
+		state.retryAt.set(providerName, now + parseCooldownMs(errorMessage, now, state.cooldownMs, resetAtSeconds));
 	}
 
 	/** Get the next available member in a pool, skipping the current one */
@@ -3511,6 +3672,86 @@ class PoolManager {
 		}
 
 		return undefined;
+	}
+
+	resetStartupSelection(): void {
+		this.startupQuotaGeneration++;
+		this.startupQuotaCheck = undefined;
+	}
+
+	/** Check once per session; defer until a model is available if necessary. */
+	selectStartupMember(ctx: ExtensionContext): Promise<void> {
+		if (!ctx.model) return Promise.resolve();
+		if (!this.startupQuotaCheck) {
+			this.startupQuotaCheck = this.selectStartupQuotaMember(ctx, ctx.model, this.startupQuotaGeneration);
+		}
+		return this.startupQuotaCheck;
+	}
+
+	private async selectStartupQuotaMember(ctx: ExtensionContext, currentModel: Model<Api>, generation: number): Promise<void> {
+		const pool = this.getPoolForProvider(currentModel.provider);
+		if (pool?.strategy !== "quota-first") return;
+		const available = new Set(this.getAvailableMembers(pool, getAuthStorage(ctx)));
+		const accounts = collectQuotaAccounts(ctx).filter(account =>
+			available.has(account.providerName)
+			&& !account.pendingSelection
+			&& ctx.modelRegistry.find(account.providerName, currentModel.id),
+		);
+		if (accounts.length === 0) return;
+		const sessionId = ctx.sessionManager?.getSessionId();
+		try {
+			const signal = AbortSignal.timeout(3000);
+			// Some checkers refresh credentials before reaching fetch. Race the
+			// whole lookup so even a refresh that ignores the signal cannot stall startup.
+			const results = (await Promise.race([
+				runQuotaChecks(accounts, signal),
+				new Promise<never>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				}),
+			]))
+				.filter(result => result.kind !== "error" && result.kind !== "missing-auth" && result.kind !== "pending-selection"
+					&& result.worstRemainingPercent !== undefined && result.worstRemainingPercent > 0)
+				.sort((left, right) => {
+					// Keep the current account on an equal quota score rather than
+					// letting the display-name tie-breaker cause an unnecessary switch.
+					if (left.kind === right.kind && left.score === right.score) {
+						return Number(right.account.providerName === currentModel.provider)
+							- Number(left.account.providerName === currentModel.provider)
+							|| compareQuotaResults(left, right);
+					}
+					return compareQuotaResults(left, right);
+				});
+			// A slow response must not undo a user model/account change or affect
+			// a different session/pool configuration.
+			const names = new Set(accounts.map(account => account.providerName));
+			if (generation !== this.startupQuotaGeneration
+				|| ctx.sessionManager?.getSessionId() !== sessionId
+				|| ctx.model?.provider !== currentModel.provider || ctx.model?.id !== currentModel.id
+				|| this.getPoolForProvider(currentModel.provider) !== pool
+				|| !sameQuotaAccounts(accounts, collectQuotaAccounts(ctx).filter(account => names.has(account.providerName)))) return;
+			const stillAvailable = new Set(this.getAvailableMembers(pool, getAuthStorage(ctx)));
+			for (const result of results) {
+				const provider = result.account.providerName;
+				if (!stillAvailable.has(provider)) continue;
+				if (provider === currentModel.provider) return;
+				const model = ctx.modelRegistry.find(provider, currentModel.id);
+				if (!model) continue;
+				try {
+					if (!await this.pi.setModel(model)) continue;
+				} catch {
+					this.recordTrace(`${provider} skipped because the startup quota switch failed`);
+					continue;
+				}
+				ctx.ui.notify(`[pool:${pool.name}] quota-first startup: selected ${provider} (${Math.round(result.worstRemainingPercent!)}% remaining at its bottleneck)`, "info");
+				ctx.ui.setStatus("multi-pass", `pool:${pool.name} | quota-first | active ${provider} (${model.id})`);
+				this.recordTrace(`startup quota-first selected ${provider} (${model.id}) via pool ${pool.name}`);
+				return;
+			}
+		} catch {
+			// Startup quota lookups are bounded and optional; preserve the active
+			// model when the endpoint is unavailable and keep normal failover.
+			this.recordTrace("startup quota check unavailable; retaining the current account");
+		}
 	}
 
 	/**
@@ -3546,7 +3787,7 @@ class PoolManager {
 			// runQuotaChecks returns sorted best-first.
 			const best = results[0];
 			// Only use quota selection when the best result has real data.
-			if (best.kind === "error" || best.kind === "missing-auth") return undefined;
+			if (best.kind === "error" || best.kind === "missing-auth" || best.kind === "pending-selection") return undefined;
 			return best.account.providerName;
 		} catch {
 			// Network failure etc. -- fall back to round-robin.
@@ -3567,12 +3808,26 @@ class PoolManager {
 		lastUserPrompt: string | null,
 	): Promise<void> {
 		const strategy = pool.strategy || "round-robin";
-		if (strategy === "round-robin") return;
+		if (strategy === "round-robin" || strategy === "per-turn") return;
 
 		const poolCandidates = plan.candidates.filter(
 			(c) => c.source === "pool" && c.poolName === pool.name,
 		);
-		if (poolCandidates.length < 2 && strategy !== "custom") return;
+		if (strategy === "weighted") {
+			const remaining = [...poolCandidates];
+			const ordered: FailoverCandidate[] = [];
+			let current = currentModel.provider;
+			while (remaining.length) {
+				const provider = weightedNextMember(pool.members, current, remaining.map(candidate => candidate.provider), pool.memberWeights ?? {}, this.getUsage());
+				const index = remaining.findIndex(candidate => candidate.provider === provider);
+				if (index < 0) break;
+				ordered.push(...remaining.splice(index, 1));
+				current = provider!;
+			}
+			plan.candidates = [...ordered, ...plan.candidates.filter(candidate => candidate.source !== "pool" || candidate.poolName !== pool.name)];
+			return;
+		}
+		if (poolCandidates.length < 2 && strategy === "quota-first") return;
 
 		if (strategy === "quota-first") {
 			try {
@@ -3605,7 +3860,6 @@ class PoolManager {
 		if (strategy === "scheduled") {
 			const available = poolCandidates.map((c) => c.provider);
 			const ordered = getScheduledMemberOrder(pool, available, new Date());
-			if (ordered.length === 0) return;
 
 			// Rebuild pool candidates in schedule order, keep chain candidates at the end.
 			const chainCandidates = plan.candidates.filter(
@@ -3682,35 +3936,84 @@ class PoolManager {
 		return this.cascadeState;
 	}
 
-	startTurn(prompt: string | null, currentModel?: Model<Api>): void {
+	/** Advance within the pool without changing the requested model. */
+	private async rotatePerTurn(currentModel: Model<Api>, ctx: ExtensionContext): Promise<Model<Api>> {
+		const pool = this.getPoolForProvider(currentModel.provider);
+		if (pool?.strategy !== "per-turn" && pool?.strategy !== "weighted") return currentModel;
+		const available = new Set(this.getAvailableMembers(pool, getAuthStorage(ctx)));
+		if (pool.strategy === "weighted") {
+			const usable = [...available].filter(provider => ctx.modelRegistry.find(provider, currentModel.id));
+			while (usable.length) {
+				const provider = weightedNextMember(pool.members, currentModel.provider, usable, pool.memberWeights ?? {}, this.getUsage());
+				if (!provider || provider === currentModel.provider) return currentModel;
+				const model = ctx.modelRegistry.find(provider, currentModel.id)!;
+				try {
+					if (await this.pi.setModel(model)) {
+						this.recordTrace(`weighted selected ${provider} (${model.id}) via pool ${pool.name}`);
+						return model;
+					}
+				} catch { /* Try the next usable account. */ }
+				usable.splice(usable.indexOf(provider), 1);
+			}
+			return currentModel;
+		}
+		const startIndex = pool.members.indexOf(currentModel.provider);
+		for (let step = 1; step < pool.members.length; step++) {
+			const provider = pool.members[(startIndex + step) % pool.members.length];
+			if (!available.has(provider)) continue;
+			const model = ctx.modelRegistry.find(provider, currentModel.id);
+			if (!model) continue;
+			try {
+				if (!await this.pi.setModel(model)) continue;
+			} catch {
+				this.recordTrace(`${provider} skipped because the per-turn switch failed`);
+				continue;
+			}
+			this.recordTrace(`per-turn selected ${provider} (${model.id}) via pool ${pool.name}`);
+			ctx.ui.setStatus("multi-pass", `pool:${pool.name} | per-turn | active ${provider} (${model.id})`);
+			return model;
+		}
+		return currentModel;
+	}
+
+	async startTurn(prompt: string | null, currentModel?: Model<Api>, ctx?: ExtensionContext): Promise<boolean> {
 		if (this.suppressNextStartTurn) {
 			this.suppressNextStartTurn = false;
-			return;
+			this.hostContinuationPending = false;
+			return false;
+		}
+		const hostContinuationPending = this.hostContinuationPending;
+		this.hostContinuationPending = false;
+		if (hostContinuationPending) {
+			if (currentModel) this.cascadeState?.attemptedProviders.add(currentModel.provider);
+			return false;
 		}
 		if (!prompt) {
 			this.cascadeState = null;
-			return;
+			return false;
 		}
-		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
-			this.cascadeState = {
-				prompt,
-				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
-				visitedChainIndexes: new Set<number>(),
-			};
-			if (currentModel) {
-				const pool = this.getPoolForProvider(currentModel.provider);
-				const source = pool ? `pool ${pool.name} (${pool.strategy || "round-robin"})` : "current model";
-				this.recordTrace(`turn started on ${currentModel.provider} (${currentModel.id}) via ${source}`);
-			}
-			return;
-		}
+		if (currentModel && ctx) currentModel = await this.rotatePerTurn(currentModel, ctx);
+		this.cascadeState = {
+			prompt,
+			attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
+			visitedChainIndexes: new Set<number>(),
+		};
 		if (currentModel) {
-			this.cascadeState.attemptedProviders.add(currentModel.provider);
+			const pool = this.getPoolForProvider(currentModel.provider);
+			const source = pool ? `pool ${pool.name} (${pool.strategy || "round-robin"})` : "current model";
+			this.recordTrace(`turn started on ${currentModel.provider} (${currentModel.id}) via ${source}`);
 		}
+		return true;
 	}
 
 	clearCascadeState(): void {
 		this.cascadeState = null;
+		this.suppressNextStartTurn = false;
+		this.hostContinuationPending = false;
+	}
+
+	continueTurn(): void {
+		this.hostContinuationPending = true;
 	}
 
 	getCascadeStateSnapshot():
@@ -3736,6 +4039,7 @@ class PoolManager {
 		lastUserPrompt: string | null,
 		config: MultiPassConfig,
 		hostWillRetry?: boolean,
+		resetAtSeconds?: number,
 	): Promise<boolean> {
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
@@ -3747,7 +4051,7 @@ class PoolManager {
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
 
 		// Mark current as exhausted before planning the forward-only cascade.
-		this.markExhausted(currentModel.provider);
+		this.markExhausted(currentModel.provider, errorMessage, resetAtSeconds);
 
 		const plan = this.buildFailoverPlan(
 			currentModel,
@@ -3778,35 +4082,33 @@ class PoolManager {
 			this.recordTrace(skip.detail);
 		}
 
-		const nextCandidate = plan.candidates[0];
+		let nextCandidate: FailoverCandidate | undefined;
+		for (let index = 0; index < plan.candidates.length; index++) {
+			const candidate = plan.candidates[index];
+			const model = ctx.modelRegistry.find(candidate.provider, candidate.modelId);
+			let issue = "model missing at runtime";
+			if (model) {
+				try {
+					if (await this.pi.setModel(model)) {
+						nextCandidate = candidate;
+						break;
+					}
+					issue = "authentication unavailable during switch";
+				} catch {
+					issue = "model switch failed";
+				}
+			}
+			cascade.attemptedProviders.add(candidate.provider);
+			ctx.ui.notify(
+				`[pool:${candidate.poolName}] ${candidate.provider} -> ${candidate.modelId} skipped (${issue}); ${formatFailoverContinuation(plan.candidates[index + 1])}`,
+				"warning",
+			);
+			this.recordTrace(`${candidate.provider} skipped because ${issue}`);
+		}
 		if (!nextCandidate) {
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			this.recordTrace(`failover exhausted in pool ${pool.name}`);
-			return false;
-		}
-
-		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
-		if (!nextModel) {
-			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
-				"warning",
-			);
-			this.recordTrace(`${nextCandidate.provider} skipped because model ${nextCandidate.modelId} is unavailable`);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
-			return false;
-		}
-
-		const success = await this.pi.setModel(nextModel);
-		if (!success) {
-			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
-				"warning",
-			);
-			this.recordTrace(`${nextCandidate.provider} skipped because authentication was unavailable`);
-			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
-			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
 		}
 
@@ -3831,6 +4133,7 @@ class PoolManager {
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 			this.recordTrace("queued follow-up because the host will not retry this error");
 		} else if (willRetry) {
+			this.continueTurn();
 			this.recordTrace("waiting for the host to retry the turn");
 		} else {
 			this.recordTrace("turn cannot be replayed because no prompt was captured");
@@ -3851,6 +4154,97 @@ class PoolManager {
 // ==========================================================================
 // /subs command handlers
 // ==========================================================================
+
+async function handleSubsDoctor(ctx: ExtensionCommandContext): Promise<void> {
+	const models = ctx.modelRegistry.getAll();
+	const knownProviders = [...new Set([...SUPPORTED_PROVIDERS, ...models.map(model => model.provider)])];
+	const modelsByProvider = Object.fromEntries(knownProviders.map(provider => [provider, models.filter(model => model.provider === provider).map(model => model.id)]));
+	const lines = [`Multi-pass doctor · ${isOmp ? "OMP" : "Pi"}`, `Agent directory: ${getAgentDir()}`];
+	let errors = 0;
+	let inheritedPools: PoolConfig[] = [];
+	for (const [path, project] of [[globalConfigPath(), false], [projectConfigPath(ctx.cwd), true]] as const) {
+		if (!existsSync(path)) { lines.push(`OK ${path}: absent (defaults/inheritance)`); continue; }
+		try {
+			const raw = JSON.parse(readFileSync(path, "utf8"));
+			const issues = validateRoutingConfig(raw, { project, knownProviders, modelsByProvider, inheritedPools });
+			if (!project) inheritedPools = normalizeMultiPassConfig(raw).pools;
+			if (!issues.length) lines.push(`OK ${path}`);
+			for (const issue of issues) {
+				if (issue.level === "error") errors++;
+				lines.push(`${issue.level.toUpperCase()} ${path} ${issue.path}: ${issue.message}`);
+			}
+		} catch {
+			errors++;
+			lines.push(`ERROR ${path}: unreadable or invalid JSON. Correct the file, then run /subs doctor again.`);
+		}
+	}
+	try {
+		const effective = loadEffectiveConfig(ctx.cwd);
+		lines.push(`Project providers: ${effective.allowedProviderNames?.join(", ") ?? "all"}`);
+		const auth = getAuthStorage(ctx);
+		const providers = effective.allowedProviderNames ?? [...new Set([...knownProviders, ...effective.subscriptions.map(subProviderName), ...effective.pools.flatMap(pool => pool.members)])];
+		for (const provider of providers) {
+			if (isOmp) {
+				const native = (ctx.modelRegistry as any).authStorage ?? ompAuth;
+				const sid = ctx.sessionManager?.getSessionId();
+				if (!(sid && native.sessions.get(provider, sid)) && native.credentials.list(provider).filter((entry: { credential: AuthStorageEntry }) => entry.credential.type === "oauth").length > 1) {
+					lines.push(`WARN ${provider}: choose a saved OMP login for this session.`); continue;
+				}
+			}
+			const credential = auth.get(provider);
+			if (!auth.hasAuth(provider)) { lines.push(`WARN ${provider}: no credential; run /login or /subs login.`); continue; }
+			if (providersRequiringReauthentication.has(provider)) {
+				lines.push(`WARN ${provider}: rejected credential; run /subs login.`);
+			} else if (credential?.type === "oauth" && typeof credential.expires === "number" && credential.expires <= Date.now()) {
+				lines.push(`WARN ${provider}: access token expired; the host must refresh it. Use /subs login if refresh fails.`);
+			} else lines.push(`OK ${provider}: credential available`);
+		}
+		if (ctx.model && effective.allowedProviderNames && !effective.allowedProviderNames.includes(ctx.model.provider)) {
+			errors++;
+			lines.push(`ERROR active provider ${ctx.model.provider} is outside the project allow-list.`);
+		}
+	} catch { errors++; lines.push("ERROR account checks could not run. Fix the configuration errors first."); }
+	lines.push(statusBarQuotaFetchedAt ? `Quota snapshot: ${Math.max(0, Math.round((Date.now() - statusBarQuotaFetchedAt) / 1000))}s old; refresh with /subs limits.` : "Quota has not been checked; use /subs limits.");
+	lines.push(`${errors} configuration error${errors === 1 ? "" : "s"}. Credentials and prompts are never included in this report.`);
+	ctx.ui.notify(lines.join("\n"), errors ? "warning" : "info");
+}
+
+async function handleSubsStats(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
+	const rows = Object.entries(poolManager.getUsage()).map(([provider, usage]) =>
+		`${provider}: ${usage.requests} requests · input ${usage.inputTokens} · output ${usage.outputTokens} · total ${usage.totalTokens} tokens`,
+	);
+	ctx.ui.notify(`Account usage — current session\n${rows.join("\n") || "No finalized assistant requests yet."}\nInput includes cache reads/writes; unavailable usage is counted as zero.`, "info");
+}
+
+async function handlePoolPreview(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
+	if (!ctx.model) { ctx.ui.notify("Select a model before previewing routing.", "warning"); return; }
+	const effective = loadEffectiveConfig(ctx.cwd);
+	const config = normalizeMultiPassConfig(effective);
+	ctx.ui.notify((await poolManager.preview(ctx.model, config, ctx)).join("\n"), "info");
+}
+
+async function handlePoolWeights(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
+	const global = loadGlobalConfig();
+	const project = loadProjectConfig(ctx.cwd);
+	const pools = project?.pools ?? global.pools;
+	const name = await ctx.ui.select("Pool to balance by weight", pools.map(pool => pool.name));
+	const pool = pools.find(pool => pool.name === name);
+	if (!pool) return;
+	const weights: Record<string, number> = {};
+	for (const member of pool.members) {
+		const raw = await ctx.ui.input(`Weight for ${member} (positive number; default 1)`, String(pool.memberWeights?.[member] ?? 1));
+		if (raw === undefined) return;
+		const weight = raw.trim() === "" ? 1 : Number(raw);
+		if (!Number.isFinite(weight) || weight <= 0) { ctx.ui.notify("Weights must be positive finite numbers. Nothing was saved.", "warning"); return; }
+		weights[member] = weight;
+	}
+	pool.memberWeights = weights;
+	pool.strategy = "weighted";
+	if (project?.pools) saveProjectConfig(ctx.cwd, project);
+	else saveGlobalConfig(global);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(`Weighted routing enabled for ${pool.name}: ${Object.entries(weights).map(([member, weight]) => `${member}=${weight}`).join(", ")}. Balances finalized request counts within this session.`, "info");
+}
 
 function getSubscriptionSource(config: MultiPassConfig, entry: SubEntry): "config" | "env" {
 	return config.subscriptions.find(
@@ -5281,14 +5675,18 @@ async function promptForPoolDefinition(
 
 	// Ask for selection strategy
 	const strategyItems = [
-		"round-robin -- Rotate members sequentially (default)",
+		"round-robin -- Rotate members sequentially on rate limits (default)",
+		"per-turn -- Rotate before each new prompt; keep retries on their account",
+		"weighted -- Balance finalized request counts by per-account weight",
 		"quota-first -- Prefer the member with the most remaining quota",
 		"scheduled -- Use per-member time windows and priority roles",
 		"custom -- Delegate to a JS selector script",
 	];
 	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
 	let strategy: PoolStrategy = "round-robin";
-	if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
+	if (strategyPick?.startsWith("per-turn")) strategy = "per-turn";
+	else if (strategyPick?.startsWith("weighted")) strategy = "weighted";
+	else if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
 	else if (strategyPick?.startsWith("scheduled")) strategy = "scheduled";
 	else if (strategyPick?.startsWith("custom")) strategy = "custom";
 
@@ -5529,12 +5927,22 @@ async function changePoolStrategy(
 		{
 			value: "round-robin",
 			label: "round-robin",
-			description: "Rotate members sequentially (default)",
+			description: "Rotate members sequentially on rate limits (default)",
+		},
+		{
+			value: "per-turn",
+			label: "per-turn",
+			description: "Rotate before each new prompt; keep retries on their account",
 		},
 		{
 			value: "quota-first",
 			label: "quota-first",
 			description: "Prefer the member with the most remaining quota",
+		},
+		{
+			value: "weighted",
+			label: "weighted",
+			description: "Balance request counts by member weights; configure with /pool weights",
 		},
 		{
 			value: "scheduled",
@@ -5618,7 +6026,7 @@ async function changePoolStrategy(
 		pool.selectorScript = scriptPath.trim();
 		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
 		delete pool.memberSchedule;
-	} else if (nextStrategy === "quota-first") {
+	} else if (nextStrategy === "quota-first" || nextStrategy === "weighted") {
 		delete pool.memberSchedule;
 		delete pool.selectorScript;
 	}
@@ -5866,7 +6274,7 @@ function formatPoolListDescription(
 function formatPoolStatusLines(
 	pool: PoolConfig,
 	authStorage: { hasAuth(provider: string): boolean },
-	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted"> & Partial<Pick<PoolManager, "getCooldownRemainingMs">>,
 ): string[] {
 	const summary = summarizePoolHealth(pool, authStorage, poolManager);
 	const strategy = pool.strategy || "round-robin";
@@ -5880,6 +6288,7 @@ function formatPoolStatusLines(
 	if (pool.selectorScript) {
 		lines.push(`selector: ${pool.selectorScript}`);
 	}
+	if (pool.strategy === "weighted") lines.push(`weights: ${pool.members.map(member => `${member}=${pool.memberWeights?.[member] ?? 1}`).join(", ")}`);
 	if (pool.members.length === 0) {
 		lines.push("  [no members configured]");
 		return lines;
@@ -5890,6 +6299,8 @@ function formatPoolStatusLines(
 		const exhausted = pool.enabled && authed && poolManager.isMemberExhausted(pool, member);
 		let status = authed ? "logged in" : "not logged in";
 		if (exhausted) status += " (rate limited, cooling down)";
+		const remaining = exhausted ? poolManager.getCooldownRemainingMs?.(member) : 0;
+		if (remaining) status += ` · ${Math.ceil(remaining / 1000)}s remaining`;
 		if (pool.enabled && authed && !exhausted) status += " (available)";
 		if (!pool.enabled && authed) status += " (pool disabled)";
 
@@ -6725,6 +7136,8 @@ async function handlePoolMenu(
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
 		"trace    -- Opt-in routing decision trace",
+		"preview  -- Preview routing without sending a prompt",
+		"weights  -- Configure relative per-account request shares",
 		`project  -- Project-level pool config (${projectConfigDir}/multi-pass.json)`,
 	];
 
@@ -6747,6 +7160,10 @@ async function handlePoolMenu(
 			return handlePoolStatus(ctx, poolManager);
 		case "trace":
 			return handlePoolTrace(ctx, poolManager);
+		case "preview":
+			return handlePoolPreview(ctx, poolManager);
+		case "weights":
+			return handlePoolWeights(ctx, poolManager);
 		case "project":
 			return handlePoolProject(ctx, poolManager);
 	}
@@ -6888,10 +7305,12 @@ async function handleSubsMenu(
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "model", label: "model", description: "Pick a model with pretty subscription labels (replaces /model)" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
+		{ value: "doctor", label: "doctor", description: "Diagnose config, credentials, models, and project restrictions" },
+		{ value: "stats", label: "stats", description: "Per-account request and token totals for this session" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 		{ value: "share", label: "share", description: "Export one OAuth account as offline QR frames (experimental)" },
 		{ value: "receive", label: "receive", description: "Import offline QR frames from another pi" },
-		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
+		{ value: "statusbar", label: "statusbar", description: "Toggle quota display (OMP widget / Pi footer)" },
 		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
 		{ value: "keeper", label: "keeper", description: "Toggle shared OAuth token keeper for parallel pi sessions" },
 	];
@@ -6934,6 +7353,12 @@ async function handleSubsMenu(
 			case "status":
 				await handleSubsStatus(ctx);
 				break;
+			case "doctor":
+				await handleSubsDoctor(ctx);
+				break;
+			case "stats":
+				await handleSubsStats(ctx, poolManager);
+				break;
 			case "limits":
 				await handleSubsLimits(ctx);
 				break;
@@ -6944,7 +7369,7 @@ async function handleSubsMenu(
 				await handleSubsReceive(ctx);
 				break;
 			case "statusbar":
-				await handleSubsStatusbar(ctx);
+				await handleSubsStatusbar(ctx, poolManager);
 				break;
 			case "intercept-model":
 				await handleSubsInterceptModel(ctx, pi);
@@ -6989,13 +7414,13 @@ async function handlePresetCreate(
 
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const allProviders: string[] = [];
-	for (const provider of builtinProviders()) {
-		allProviders.push(provider.id);
-	}
-	for (const entry of allSubs) {
-		allProviders.push(subProviderName(entry));
-	}
+	const effective = loadEffectiveConfig(ctx.cwd);
+	const allowed = effective.allowedProviderNames && new Set(effective.allowedProviderNames);
+	const allProviders = [...new Set([
+		...ctx.modelRegistry.getAll().map((model) => model.provider),
+		...builtinProviders().map((provider) => provider.id),
+		...allSubs.map(subProviderName),
+	])].filter((provider) => !allowed || allowed.has(provider));
 
 	const entries: PresetEntry[] = [];
 	let adding = true;
@@ -7025,12 +7450,8 @@ async function handlePresetCreate(
 		}
 
 		const provider = picked.split(" -- ")[0].trim();
-		const base = getBaseProvider(provider);
-		if (!base) continue;
-
-		const models = (minimaxBase(provider)
-			? providerModelChoices(ctx, provider)
-			: getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		if (!allProviders.includes(provider)) continue;
+		const models = providerModelChoices(ctx, provider).map((m) => m.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;
@@ -7245,6 +7666,8 @@ async function handlePresetMenu(
 
 const STATUS_BAR_QUOTA_REFRESH_MS = 5 * 60_000;
 const STATUS_BAR_CLOCK_MS = 30_000;
+const OMP_QUOTA_RAINBOW_MS = 180;
+const OMP_QUOTA_RAINBOW_COLORS = [196, 202, 226, 46, 51, 39, 129, 201];
 
 const STATUS_BAR_GLYPHS: Record<string, string> = {
 	anthropic: "\u2733",
@@ -7275,7 +7698,9 @@ interface StatusBarAccount {
 let statusBarAccounts: StatusBarAccount[] = [];
 const statusBarQuota = new Map<string, QuotaCheckResult>();
 let statusBarQuotaFetchedAt = 0;
-let statusBarRefreshInFlight = false;
+let statusBarRefreshInFlight: Promise<void> | undefined;
+let disposeOmpStatusBar: (() => void) | undefined;
+let refreshOmpStatusBar: (() => void) | undefined;
 
 function statusBarShortName(providerName: string, subs: SubEntry[]): string {
 	const entry = subs.find((candidate) => subProviderName(candidate) === providerName);
@@ -7296,24 +7721,50 @@ function collectStatusBarAccounts(ctx: ExtensionContext): StatusBarAccount[] {
 	}));
 }
 
+function sameQuotaAccounts(left: QuotaAccount[], right: QuotaAccount[]): boolean {
+	return left.length === right.length && left.every((account) => {
+		const other = right.find((candidate) => candidate.providerName === account.providerName);
+		return other !== undefined
+			&& account.auth?.access === other.auth?.access
+			&& account.auth?.accountId === other.auth?.accountId
+			&& Boolean(account.pendingSelection) === Boolean(other.pendingSelection);
+	});
+}
+
+function knownQuotaResetAt(ctx: ExtensionContext, provider: string | undefined): number | undefined {
+	if (!provider || statusBarQuotaFetchedAt <= Date.now() - STATUS_BAR_QUOTA_REFRESH_MS) return undefined;
+	const cached = statusBarQuota.get(provider);
+	const current = collectQuotaAccounts(ctx).find(account => account.providerName === provider);
+	if (!cached || !current || current.pendingSelection || !sameQuotaAccounts([cached.account], [current])) return undefined;
+	const resets = [...(cached.windows ?? []), ...(cached.models ?? [])]
+		.filter(window => window.remainingPercent !== undefined && window.remainingPercent <= 0 && window.resetAt && window.resetAt * 1000 > Date.now())
+		.map(window => window.resetAt!);
+	return resets.length ? Math.max(...resets) : undefined;
+}
+
+function updateStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void {
+	const accounts = collectQuotaAccounts(ctx);
+	const changed = !sameQuotaAccounts([...statusBarQuota.values()].map((result) => result.account), accounts);
+	if (changed) statusBarQuota.clear();
+	statusBarAccounts = collectStatusBarAccounts(ctx);
+	if (changed || Date.now() - statusBarQuotaFetchedAt > STATUS_BAR_QUOTA_REFRESH_MS) {
+		refreshStatusBarQuota(ctx, onDone);
+	}
+}
+
 function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void {
-	if (statusBarRefreshInFlight) return;
-	statusBarRefreshInFlight = true;
+	if (statusBarRefreshInFlight) {
+		void statusBarRefreshInFlight.then(onDone);
+		return;
+	}
 	statusBarAccounts = collectStatusBarAccounts(ctx);
 	const accounts = collectQuotaAccounts(ctx);
-	runQuotaChecks(accounts.filter((account) => account.auth))
+	let selectionChanged = false;
+	statusBarRefreshInFlight = runQuotaChecks(accounts)
 		.then((results) => {
+			selectionChanged = !sameQuotaAccounts(accounts, collectQuotaAccounts(ctx));
+			if (selectionChanged) return;
 			statusBarQuota.clear();
-			for (const account of accounts) {
-				if (account.auth) continue;
-				statusBarQuota.set(account.providerName, {
-					account,
-					kind: "missing-auth",
-					summary: "not logged in",
-					details: [],
-					score: 0,
-				});
-			}
 			for (const result of results) {
 				statusBarQuota.set(result.account.providerName, result);
 			}
@@ -7321,8 +7772,9 @@ function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void 
 		})
 		.catch(() => {})
 		.finally(() => {
-			statusBarRefreshInFlight = false;
-			onDone();
+			statusBarRefreshInFlight = undefined;
+			if (selectionChanged) refreshStatusBarQuota(ctx, onDone);
+			else onDone();
 		});
 }
 
@@ -7423,8 +7875,137 @@ function createStatusBarComponent(
 	};
 }
 
-function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled: boolean): void {
+function renderOmpQuotaTitle(): string {
+	const phase = Math.floor(Date.now() / OMP_QUOTA_RAINBOW_MS) % OMP_QUOTA_RAINBOW_COLORS.length;
+	return Array.from("Multi Pass", (character, index) =>
+		`\x1b[38;5;${OMP_QUOTA_RAINBOW_COLORS[(index + phase) % OMP_QUOTA_RAINBOW_COLORS.length]}m${character}\x1b[0m`,
+	).join("");
+}
+
+function renderOmpQuotaLines(ctx: ExtensionContext, width = process.stdout.columns || 80, poolManager?: PoolManager): string[] {
+	const theme = ctx.ui.theme;
+	const title = `${renderOmpQuotaTitle()}${theme.fg("dim", " · quota left")}`;
+	const lines: string[] = [];
+	const nameWidth = Math.max(0, ...statusBarAccounts.map((account) => visibleWidth(account.shortName)));
+	for (const account of statusBarAccounts) {
+		const quota = statusBarQuota.get(account.providerName);
+		const windows = [...(quota?.windows ?? []), ...(quota?.models ?? [])];
+		const remaining = windows.length > 0
+			? windows.map((window) => {
+				const percent = window.remainingPercent;
+				const value = percent === undefined ? "unknown" : `${Math.round(percent)}%`;
+				const reset = window.resetAt ? theme.fg("dim", ` (reset ${formatResetShort(window.resetAt)})`) : "";
+				return `${window.label} ${theme.fg(quotaBarColor(percent), value)}${reset}`;
+			}).join(theme.fg("dim", " · "))
+			: quota?.worstRemainingPercent !== undefined
+				? theme.fg(quotaBarColor(quota.worstRemainingPercent), `${Math.round(quota.worstRemainingPercent)}%`)
+				: theme.fg(quota?.kind === "error" ? "error" : "dim", quota ? quota.summary : "checking…");
+		const active = ctx.model?.provider === account.providerName;
+		const name = `${active ? "●" : "○"} ${account.shortName}`;
+		const padding = " ".repeat(nameWidth - visibleWidth(account.shortName));
+		lines.push(`${theme.fg(active ? "accent" : "muted", name)}${padding}  ${remaining}`);
+	}
+	if (statusBarAccounts.length === 0) lines.push("No supported quota accounts. Use /subs limits for details.");
+	const pool = ctx.model ? poolManager?.getPoolForProvider(ctx.model.provider) : undefined;
+	lines.push(`${theme.fg("dim", "pool: ")}${theme.fg(pool ? "accent" : "muted", pool?.name ?? "none")}`);
+	lines.push(theme.fg("dim", statusBarQuotaFetchedAt ? `quota: checked ${Math.max(0, Math.floor((Date.now() - statusBarQuotaFetchedAt) / 1000))}s ago` : "quota: not checked yet"));
+	if (width < 5) return [title, ...lines].map((line) => truncateToWidth(line, Math.max(0, width)));
+	const contentWidth = Math.min(
+		Math.max(visibleWidth(title) + 2, ...lines.map((line) => visibleWidth(line))),
+		width - 4,
+	);
+	const heading = `─ ${truncateToWidth(title, contentWidth - 1)} `;
+	const rows = lines.flatMap((line) => wrapTextWithAnsi(line, contentWidth));
+	// Headroom leaves its frame in the terminal's default foreground.
+	return [
+		`╭${heading}${"─".repeat(Math.max(0, contentWidth + 2 - visibleWidth(heading)))}╮`,
+		...rows.map((line) => `│ ${line}${" ".repeat(Math.max(0, contentWidth - visibleWidth(line)))} │`),
+		`╰${"─".repeat(contentWidth + 2)}╯`,
+	];
+}
+
+function applyOmpStatusBar(ctx: ExtensionContext, enabled: boolean, poolManager?: PoolManager): void {
+	disposeOmpStatusBar?.();
+	disposeOmpStatusBar = undefined;
+	if (!enabled) {
+		ctx.ui.setWidget("multi-pass-quota", undefined, { placement: "aboveEditor" });
+		return;
+	}
+	let disposed = false;
+	const ui = ctx.ui;
+	const setWidget = ui.setWidget;
+	let headroom: { lines: string[]; options?: Parameters<typeof ui.setWidget>[2] } | undefined;
+	let headroomHidden = false;
+	const publish: typeof ui.setWidget = (key, content, options) => setWidget.call(ui, key, content as any, options);
+	const render = () => {
+		if (disposed) return;
+		const width = process.stdout.columns || 102;
+		const headroomWidth = headroom ? Math.max(0, ...headroom.lines.map((line) => visibleWidth(line))) : 0;
+		const quotaWidth = width - headroomWidth - 2;
+		if (headroom && headroomWidth > 0 && quotaWidth >= 40) {
+			const quota = renderOmpQuotaLines(ctx, quotaWidth, poolManager);
+			const height = Math.max(headroom.lines.length, quota.length);
+			const padFrame = (lines: string[]): string[] => {
+				if (lines.length >= height || !lines.at(-1)?.startsWith("╰")) return lines;
+				const innerWidth = Math.max(0, visibleWidth(lines[0]) - 2);
+				const blank = `│${" ".repeat(innerWidth)}│`;
+				return [...lines.slice(0, -1), ...Array(height - lines.length).fill(blank), lines.at(-1)!];
+			};
+			const leftRows = padFrame(headroom.lines);
+			const rightRows = padFrame(quota);
+			const rows = Array.from({ length: height }, (_, index) => {
+				const left = leftRows[index] ?? "";
+				const right = rightRows[index] ?? "";
+				return `${left}${" ".repeat(Math.max(0, headroomWidth - visibleWidth(left)) + 2)}${right}`;
+			});
+			if (!headroomHidden) publish("headroom", undefined, headroom.options);
+			headroomHidden = true;
+			publish("multi-pass-quota", rows, { placement: "aboveEditor" });
+		} else {
+			if (headroom) publish("headroom", headroom.lines, headroom.options);
+			headroomHidden = false;
+			publish("multi-pass-quota", renderOmpQuotaLines(ctx, width, poolManager), { placement: "aboveEditor" });
+		}
+	};
+	// OMP shares this UI context between extensions, but only offers vertical
+	// widget slots. Capture Headroom's string rows so the two live widgets can
+	// share one slot; forward every unrelated widget and restore Headroom on exit.
+	const groupedSetWidget: typeof ui.setWidget = (key, content, options) => {
+		if (disposed || key !== "headroom") return publish(key, content as any, options);
+		if (Array.isArray(content)) {
+			headroom = { lines: [...content], options };
+		} else {
+			headroom = undefined;
+			headroomHidden = false;
+			publish(key, content as any, options);
+		}
+		render();
+	};
+	ui.setWidget = groupedSetWidget;
+	const tick = () => {
+		updateStatusBarQuota(ctx, render);
+		render();
+	};
+	refreshOmpStatusBar = tick;
+	statusBarAccounts = collectStatusBarAccounts(ctx);
+	const timer = setInterval(tick, STATUS_BAR_CLOCK_MS);
+	// Animation redraws cached quota data; network refresh keeps its own cadence.
+	const animationTimer = setInterval(render, OMP_QUOTA_RAINBOW_MS);
+	disposeOmpStatusBar = () => {
+		disposed = true;
+		clearInterval(timer);
+		clearInterval(animationTimer);
+		if (refreshOmpStatusBar === tick) refreshOmpStatusBar = undefined;
+		if (ui.setWidget === groupedSetWidget) ui.setWidget = setWidget;
+		if (headroomHidden && headroom) publish("headroom", headroom.lines, headroom.options);
+	};
+	tick();
+}
+
+function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled: boolean, poolManager?: PoolManager): void {
 	if (!ctx.hasUI) return;
+	// OMP's setFooter is a no-op, including in its interactive controller.
+	if (isOmp) return applyOmpStatusBar(ctx, enabled, poolManager);
 	if (!enabled) {
 		ctx.ui.setFooter(undefined);
 		return;
@@ -7548,15 +8129,15 @@ async function handleSubsKeeper(ctx: ExtensionCommandContext): Promise<void> {
 	);
 }
 
-async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsStatusbar(ctx: ExtensionCommandContext, poolManager: PoolManager): Promise<void> {
 	const config = loadGlobalConfig();
 	config.statusBar = !config.statusBar;
 	saveGlobalConfig(config);
-	applyStatusBar(ctx, config.statusBar);
+	applyStatusBar(ctx, config.statusBar, poolManager);
 	ctx.ui.notify(
 		config.statusBar
-			? "multi-pass status bar enabled (/subs statusbar to disable)"
-			: "multi-pass status bar disabled, default footer restored",
+			? isOmp ? "multi-pass quota widget enabled above the editor (/subs statusbar to disable)" : "multi-pass status bar enabled (/subs statusbar to disable)"
+			: isOmp ? "multi-pass quota widget disabled" : "multi-pass status bar disabled, default footer restored",
 		"info",
 	);
 }
@@ -7628,6 +8209,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		setModelRegistry(ctx.modelRegistry);
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
+		poolManager.clearCascadeState();
+		poolManager.resetStartupSelection();
+		poolManager.resetUsage();
 
 		const statusParts: string[] = [];
 		const enabledChains = effective.chains.filter((chain) => chain.enabled);
@@ -7651,17 +8235,28 @@ export default function multiSub(pi: ExtensionAPI) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
 
-		const persisted = loadGlobalConfig();
-		if (persisted.statusBar) {
-			applyStatusBar(ctx, true);
-		}
-		applyModelIntercept(ctx, pi, persisted.interceptModel === true);
-
 		await enforceProjectRestriction(ctx, "session");
+		await poolManager.selectStartupMember(ctx);
+
+		const persisted = loadGlobalConfig();
+		if (persisted.statusBar || isOmp) applyStatusBar(ctx, persisted.statusBar === true, poolManager);
+		applyModelIntercept(ctx, pi, persisted.interceptModel === true);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		await enforceProjectRestriction(ctx, "model");
+		refreshOmpStatusBar?.();
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (isOmp && ctx.hasUI) applyOmpStatusBar(ctx, false);
+	});
+
+	pi.on("message_end", async (event, ctx) => {
+		const message = (event as any).message;
+		if (message?.role !== "assistant") return;
+		const provider = typeof message.provider === "string" ? message.provider : ctx.model?.provider;
+		if (provider) poolManager.recordUsage(provider, message);
 	});
 
 	pi.on("input", async (event, ctx) => {
@@ -7677,24 +8272,51 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// Listen for user input to track last prompt
 	pi.on("before_agent_start", async (event, ctx) => {
-		lastUserPrompt = event.prompt;
-		poolManager.startTurn(event.prompt, ctx.model);
+		await poolManager.selectStartupMember(ctx);
+		const newTurn = await poolManager.startTurn(event.prompt, ctx.model, ctx);
+		if (newTurn) lastUserPrompt = event.prompt;
+		refreshOmpStatusBar?.();
+	});
+
+	// Cancelling or exhausting host retries ends the pending continuation.
+	pi.on("auto_retry_end", async (event, ctx) => {
+		if (!event.success) {
+			poolManager.clearCascadeState();
+		}
 	});
 
 	// Listen for errors to trigger pool rotation
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
-		if (!event.messages || event.messages.length === 0) return;
+		refreshOmpStatusBar?.();
+		const willContinue = (event as AgentEndEvent & { willContinue?: boolean }).willContinue === true;
+		if (willContinue) poolManager.continueTurn();
+		const finishTurn = () => {
+			if (!willContinue) {
+				poolManager.clearCascadeState();
+			}
+		};
+		if (!event.messages || event.messages.length === 0) {
+			finishTurn();
+			return;
+		}
 
 		const lastMsg = event.messages[event.messages.length - 1];
-		if (!lastMsg || lastMsg.role !== "assistant") return;
+		if (!lastMsg || lastMsg.role !== "assistant") {
+			finishTurn();
+			return;
+		}
 
 		const assistantMsg = lastMsg as any;
 		const providerName = ctx.model?.provider;
 		if (assistantMsg.stopReason !== "error") {
 			if (providerName) providersRequiringReauthentication.delete(providerName);
+			finishTurn();
 			return;
 		}
-		if (!assistantMsg.errorMessage) return;
+		if (!assistantMsg.errorMessage) {
+			finishTurn();
+			return;
+		}
 
 		const effective = loadEffectiveConfig(ctx.cwd);
 		if (
@@ -7722,8 +8344,14 @@ export default function multiSub(pi: ExtensionAPI) {
 				presets: effective.presets,
 			}),
 			isOmp ? (event as AgentEndEvent & { willContinue?: boolean }).willContinue === true : undefined,
+			knownQuotaResetAt(ctx, ctx.model?.provider),
 		);
 
+		if (!rotated && !(isOmp ? willContinue : piWillRetryTurn(assistantMsg.errorMessage))) {
+			finishTurn();
+		} else if (!rotated) {
+			poolManager.continueTurn();
+		}
 		if (!rotated && isRateLimitError(assistantMsg.errorMessage)) {
 			const pool = ctx.model
 				? poolManager.getPoolForProvider(ctx.model.provider)
@@ -7747,7 +8375,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model", "keeper"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "doctor", "stats", "limits", "share", "receive", "statusbar", "intercept-model", "keeper"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7781,6 +8409,10 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handleSubsStatus(ctx);
+				case "doctor":
+					return handleSubsDoctor(ctx);
+				case "stats":
+					return handleSubsStats(ctx, poolManager);
 				case "limits":
 				case "quota":
 				case "usage":
@@ -7791,7 +8423,7 @@ export default function multiSub(pi: ExtensionAPI) {
 					return handleSubsReceive(ctx);
 				case "statusbar":
 				case "bar":
-					return handleSubsStatusbar(ctx);
+					return handleSubsStatusbar(ctx, poolManager);
 				case "keeper":
 				case "tokenkeeper":
 					return handleSubsKeeper(ctx);
@@ -7808,7 +8440,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("pool", {
 		description: "Manage subscription rotation pools",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "trace", "project"];
+			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "trace", "preview", "weights", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7863,6 +8495,10 @@ export default function multiSub(pi: ExtensionAPI) {
 					return handlePoolStatus(ctx, poolManager);
 				case "trace":
 					return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
+				case "preview":
+					return handlePoolPreview(ctx, poolManager);
+				case "weights":
+					return handlePoolWeights(ctx, poolManager);
 				case "project":
 					return handlePoolProject(ctx, poolManager);
 				default:

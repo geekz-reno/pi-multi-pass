@@ -2,16 +2,13 @@ import assert from "node:assert/strict";
 
 function normalizeCodexUsageWindow(window) {
   if (!window || typeof window !== "object" || Array.isArray(window)) return undefined;
+  if (typeof window.used_percent !== "number" || !Number.isFinite(window.used_percent)
+    || typeof window.limit_window_seconds !== "number" || !Number.isFinite(window.limit_window_seconds) || window.limit_window_seconds <= 0) return undefined;
   return {
-    usedPercent: typeof window.used_percent === "number" ? window.used_percent : 0,
-    windowSeconds: typeof window.limit_window_seconds === "number" ? window.limit_window_seconds : 0,
+    usedPercent: window.used_percent,
+    windowSeconds: window.limit_window_seconds,
     resetAt: typeof window.reset_at === "number" ? window.reset_at : undefined,
   };
-}
-
-function matchesUsageWindow(window, expectedSeconds) {
-  if (!window) return false;
-  return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
 }
 
 function parseCodexUsageSnapshot(data) {
@@ -19,12 +16,11 @@ function parseCodexUsageSnapshot(data) {
   const windows = [
     normalizeCodexUsageWindow(rateLimit.primary_window),
     normalizeCodexUsageWindow(rateLimit.secondary_window),
-  ].filter(Boolean);
+  ].filter(Boolean).sort((a, b) => a.windowSeconds - b.windowSeconds);
   return {
     planType: typeof data?.plan_type === "string" ? data.plan_type : "unknown",
     email: typeof data?.email === "string" ? data.email : "",
-    fiveHour: windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60)),
-    weekly: windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60)),
+    windows,
   };
 }
 
@@ -34,7 +30,7 @@ function getCodexWindowRemaining(window) {
 }
 
 function classifyCodexQuotaKind(snapshot) {
-  const values = [getCodexWindowRemaining(snapshot.fiveHour), getCodexWindowRemaining(snapshot.weekly)]
+  const values = snapshot.windows.map(getCodexWindowRemaining)
     .filter((value) => value !== undefined);
   if (values.length === 0) return { kind: "error", score: 0 };
   const bottleneck = Math.min(...values);
@@ -191,30 +187,30 @@ function runWindowClassificationChecks() {
 
   assert.equal(snapshot.planType, "pro");
   assert.equal(snapshot.email, "test@example.com");
-  assert.equal(snapshot.fiveHour.windowSeconds, 5 * 60 * 60);
-  assert.equal(snapshot.weekly.windowSeconds, 7 * 24 * 60 * 60);
-  assert.equal(getCodexWindowRemaining(snapshot.fiveHour), 90);
-  assert.equal(getCodexWindowRemaining(snapshot.weekly), 65);
+  assert.equal(snapshot.windows[0].windowSeconds, 5 * 60 * 60);
+  assert.equal(snapshot.windows[1].windowSeconds, 7 * 24 * 60 * 60);
+  assert.equal(getCodexWindowRemaining(snapshot.windows[0]), 90);
+  assert.equal(getCodexWindowRemaining(snapshot.windows[1]), 65);
 }
 
 function runSeverityChecks() {
   assert.equal(
-    classifyCodexQuotaKind({ fiveHour: { usedPercent: 20 }, weekly: { usedPercent: 40 } }).kind,
+    classifyCodexQuotaKind({ windows: [{ usedPercent: 20 }, { usedPercent: 40 }] }).kind,
     "ready",
   );
   assert.equal(
-    classifyCodexQuotaKind({ fiveHour: { usedPercent: 75 }, weekly: { usedPercent: 20 } }).kind,
+    classifyCodexQuotaKind({ windows: [{ usedPercent: 75 }, { usedPercent: 20 }] }).kind,
     "watch",
   );
   assert.equal(
-    classifyCodexQuotaKind({ fiveHour: { usedPercent: 88 }, weekly: { usedPercent: 15 } }).kind,
+    classifyCodexQuotaKind({ windows: [{ usedPercent: 88 }, { usedPercent: 15 }] }).kind,
     "low",
   );
   assert.equal(
-    classifyCodexQuotaKind({ fiveHour: { usedPercent: 97 }, weekly: { usedPercent: 10 } }).kind,
+    classifyCodexQuotaKind({ windows: [{ usedPercent: 97 }, { usedPercent: 10 }] }).kind,
     "blocked",
   );
-  assert.equal(classifyCodexQuotaKind({}).kind, "error");
+  assert.equal(classifyCodexQuotaKind({ windows: [] }).kind, "error");
 }
 
 function runGoogleGeminiQuotaParsingChecks() {

@@ -81,8 +81,9 @@ ownership instead of the separate Pi token keeper.
 
 After a rate limit, multi-pass respects OMP's `willContinue` signal: it leaves
 pending host retries alone and replays the captured prompt when the host has
-stopped. The optional custom status bar works with OMP's two-argument footer
-API; Pi-only branch/status metadata is omitted there.
+stopped. `/subs statusbar` shows remaining quota in an OMP widget above the
+editor, alongside widgets such as Headroom. OMP's custom footer API is a no-op;
+Pi uses the custom footer instead.
 
 ## Validate OMP compatibility
 
@@ -91,6 +92,17 @@ With OMP installed and the runtime dependencies installed, run:
 ```bash
 npm run test:omp
 ```
+
+Run the focused feature and regression checks with Node.js 22.13+ and OMP:
+
+```bash
+npm run test:features
+```
+
+The joint smoke test loads this extension and the sibling `omp-headroom`
+checkout in one isolated OMP session. Set `MULTIPASS_HEADROOM_CHECKOUT` to use
+another Headroom checkout. It explicitly skips when that checkout is absent.
+Provider and proxy calls are mocked; no paid requests or real logins run.
 
 These integration checks use isolated configuration and dummy credentials,
 disable outbound fetches, and cover provider registration, OAuth callback
@@ -103,7 +115,7 @@ require a separate Pi installation.
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
-- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
+- **Smart pool strategies**: `round-robin`, `per-turn`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
@@ -139,9 +151,13 @@ can still reach the older models there.
 /login                 Authenticate the new subscription
 /subs switch           Manually switch to another subscription/provider
 /subs limits           Check built-in quota support (Anthropic + Codex + Google)
+/subs doctor           Diagnose configuration, credentials, and model availability
+/subs stats            Per-account requests and token totals for this session
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
 /pool trace start      Start recording routing decisions for this session
+/pool preview          Preview account selection and failover without a request
+/pool weights          Configure weighted request balancing for a pool
 /mp-preset create         Create a named routing preset across providers
 /mp-preset coding-premium Activate a preset by name
 ```
@@ -161,7 +177,10 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs switch       Manually switch to a subscription/provider now
 /subs list         List subscriptions with auth status; select one for quick actions
 /subs status       Detailed status (token expiry, pool membership)
+/subs doctor       Inspect raw configs, project restrictions, credentials and models
+/subs stats        Current-session per-account request/input/output/total tokens
 /subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
+/subs statusbar    Toggle persistent quota display (OMP widget / Pi footer)
 /subs share        Show offline QR frames or a full copyable export string (experimental)
 /subs receive      Paste the full string or frame URIs into another pi
 /subs keeper       Toggle the shared OAuth token keeper (off by default)
@@ -201,6 +220,8 @@ if you actually run several pi sessions at once.
 /pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
 /pool status       Member health (logged in, rate limited, cooling down)
 /pool trace        Manage the opt-in routing decision trace
+/pool preview      Read-only routing preview using current eligibility and cached quota
+/pool weights      Set positive per-account weights and enable weighted routing
 /pool project      Project-level config (restrict subs, override pools/chains)
 ```
 
@@ -310,28 +331,76 @@ cd ~/side-project
 2. Multi-pass detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
 4. Retries your last prompt automatically
-5. After a 5-minute cooldown, `openai-codex` becomes available again
+5. The account becomes eligible after its reported retry/reset time, or five minutes when the provider supplies no usable hint
+
+Cooldowns use `Retry-After`, structured reset timestamps, and retry-duration
+messages when available. A fresh quota snapshot with exhausted windows can extend
+the delay until all known exhausted windows reset. `/pool preview` shows the
+remaining cooldown; the original provider message is not stored in the trace.
 
 ### Pool selection strategy
 
-Each pool has a `strategy` that controls how the next member is chosen on failover:
+Each pool has a `strategy` that controls account selection. The default switches only after a rate-limit error; `quota-first` also selects an account at session startup, and `per-turn` rotates before each new prompt:
 
 | Strategy | Behavior |
 |---|---|
-| `round-robin` | Rotate sequentially through members (default) |
-| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
+| `round-robin` | Rotate sequentially through members on rate-limit failover (default) |
+| `per-turn` | Rotate to the next usable member before each new prompt; keep tool calls and retries within that turn on the selected account, except rate-limit failover |
+| `weighted` | Before each new prompt, prefer the usable account with the lowest finalized request count divided by its weight; preserve the account through continuations and retries |
+| `quota-first` | Check quota at session startup, including the current account, and select the healthiest eligible member; check alternatives again on rate-limit failover |
 | `scheduled` | Use per-member time windows and priority roles |
 | `custom` | Delegate to a user-provided JS selector script |
 
 Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
 
-All strategies fall back to round-robin when their specific data is unavailable.
+Quota, schedule, and custom strategies fall back to round-robin when their specific data is unavailable.
+
+#### `per-turn`
+
+With accounts A and B in one enabled pool, each new prompt advances A → B → A, including repeated identical prompts. The selected model ID stays the same. Accounts without authentication, in a rate-limit cooldown, or missing that model are skipped. If no alternative can be selected, the current account stays active. Tool calls, host continuations, and automatic retries do not trigger another rotation; rate-limit errors still use the existing failover and retry flow. On OMP, queued follow-ups rotate when their next run starts; steering messages stay within the current turn. This alternates prompts, so it does not guarantee equal token usage.
+
+Set `"strategy": "per-turn"` on the pool, or select `per-turn` in the pool strategy menu.
+
+#### `weighted`
+
+Run `/pool weights`, select a pool, and enter a positive weight for each account.
+For weights 1 and 2, the second account receives about twice as many requests
+over time. Missing weights default to 1. Authentication, cooldowns, project
+restrictions and model availability still apply. Only rate limits can move a
+running turn to another account.
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2"],
+  "enabled": true,
+  "strategy": "weighted",
+  "memberWeights": { "openai-codex": 1, "openai-codex-2": 2 }
+}
+```
+
+`/subs stats` reports finalized assistant request counts and normalized token
+usage for each account. Input totals include cache reads/writes. Counts reset
+when a session starts, including resume; they are not billing or lifetime totals.
+Weighted balancing uses request counts, so it does not promise equal token use.
+
+`/pool preview` sends no prompt, performs no quota refresh, and does not execute
+custom selector scripts or change routing state. It shows the next prompt's
+account, rate-limit fallback order, and skipped accounts. Quota-first previews
+use cached quota; custom strategy previews show their round-robin fallback.
+`/subs doctor` checks raw configuration before normalization and reports
+credential/selection problems without printing credentials or prompt contents.
 
 #### `quota-first`
 
-You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
+At session startup, `quota-first` checks every authenticated, eligible pool member that can serve the selected model, including the current account. If Codex A has 50% remaining and Codex B has 100% across the reported windows, it selects B before your first prompt. It keeps that account through subsequent prompts and checks alternatives again only on rate-limit failover.
 
-Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
+Ranking uses the lowest remaining percentage across reported windows (for example, both 5h and 7d), rather than just the first displayed percentage. Equal scores keep the current account. Project restrictions and rate-limit cooldowns still apply, and the selected model ID stays the same. Quota lookups run once per session with a three-second deadline. Missing/failed quota data or no usable alternative leaves the current account unchanged; a late response cannot overwrite a user model/account change. OMP providers with several saved logins and no selected session account are excluded from this check.
+
+For failover with 3 accounts, A at 80%, B at 20%, and C at 60%, it prefers A if A is an eligible alternative; the failed account is excluded.
+
+Uses the same built-in quota checkers as `/subs limits`.
 
 ```json
 {
@@ -506,16 +575,39 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 
 `/subs limits` uses a provider-specific checker registry.
 
+Quota checks have a ten-second deadline and retain successful account results
+when another account fails or times out. The quota widget can refresh again
+after a stalled check; session-start selection keeps its shorter three-second
+deadline.
+
 Currently implemented:
 
 - `anthropic`: fetches Claude subscription usage from `https://api.anthropic.com/api/oauth/usage`, then summarizes the 5-hour and 7-day windows plus any model-scoped weekly limits (for example Opus) for the base account and extra Anthropic subscriptions. Plan and email come from the OAuth profile endpoint.
-- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
+- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes each account's returned quota windows, including 5-hour, 7-day, and 30-day windows, for the base account and any configured extra Codex subscriptions.
 - `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
 - `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
 
 Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
 
 `/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
+
+For a persistent display, run `/subs statusbar`. It refreshes quota every five
+minutes and remembers the toggle across sessions. In OMP, a rounded box above the
+editor shows each supported account's remaining windows and reset times; `●`
+marks the active account. Percentages turn yellow at 30% remaining and red at
+15%; the box wraps to fit narrow terminals. Run the command again to hide it. In Pi, the same
+toggle enables the custom footer with each account's lowest remaining percentage.
+The OMP box also shows `pool: <name>` for the active provider's rotation pool,
+or `pool: none` when it does not belong to an enabled pool for this project.
+When Headroom is running, its box appears on the left and Multi Pass on the right
+in a shared row. Narrow terminals stack the boxes instead. Disabling Multi Pass
+restores Headroom's separate widget.
+When OMP stores multiple native logins under one provider, the display follows
+the credential selected for the current session rather than the first saved login.
+Until OMP selects a login, the display says `waiting for OMP account selection`.
+Account changes bypass the five-minute quota cache; the widget checks after turns,
+model changes, and on its regular display tick. Responses for a previous login
+are discarded.
 
 When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
 
