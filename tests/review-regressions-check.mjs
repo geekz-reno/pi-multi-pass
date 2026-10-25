@@ -28,6 +28,51 @@ const routingInsights = load(
 
 const tests = [];
 function test(name, run) { tests.push({ name, run }); }
+
+const { parseScheduleWindowInput: scheduleParser, promptForScheduleWindows } = load(
+  piece("function parseScheduleWindowInput(", "function buildPoolConfig("),
+  { ALL_DAYS: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] },
+  "{ parseScheduleWindowInput, promptForScheduleWindows }",
+);
+
+test("schedule input rejects the whole window when any component is invalid", () => {
+  for (const input of ["9-9", "9-9 mon-fri", "9-17 mon-frii", "25-6 mon", "typo", "mon 9-9"]) {
+    assert.equal(scheduleParser(input), null, input);
+  }
+  assert.deepEqual(scheduleParser("9-17 mon-fri"), { hours: [9, 17], days: ["mon", "tue", "wed", "thu", "fri"] });
+  assert.deepEqual(scheduleParser("22-6"), { hours: [22, 6] });
+  assert.deepEqual(scheduleParser("mon wed"), { days: ["mon", "wed"] });
+  assert.deepEqual(scheduleParser("2026-10-01..2026-10-31"), { dateRange: { from: "2026-10-01", to: "2026-10-31" } });
+});
+
+test("invalid schedule prompts retry instead of configuring an always-active member", async () => {
+  const inputs = ["9-9 mon-fri", "9-17 mon-frii", "9-17 mon-fri"];
+  const notices = [];
+  const windows = await promptForScheduleWindows({ ui: {
+    input: async () => inputs.shift(),
+    notify: (message) => notices.push(message),
+  } }, "account");
+  assert.deepEqual(windows, [{ hours: [9, 17], days: ["mon", "tue", "wed", "thu", "fri"] }]);
+  assert.equal(notices.length, 2);
+  assert.equal(await promptForScheduleWindows({ ui: { input: async () => undefined } }, "account"), undefined);
+  assert.deepEqual(await promptForScheduleWindows({ ui: { input: async () => "  " } }, "account"), []);
+});
+
+test("canceling a schedule strategy edit preserves the existing pool and config", async () => {
+  const pool = { name: "main", strategy: "custom", selectorScript: "select.js", members: ["account"] };
+  const config = { pools: [pool] };
+  const before = structuredClone(config);
+  let saves = 0;
+  const change = load(piece("async function changePoolStrategy(", "async function removePoolConfig("), {
+    showWrappedSelect: async () => "scheduled",
+    promptForScheduleWindows,
+    saveGlobalConfig: () => { saves++; },
+    reloadPoolManagerForCurrentProject: () => assert.fail("unexpected reload"),
+  }, "changePoolStrategy");
+  await change({ ui: { select: async () => "preferred", input: async () => undefined } }, {}, config, pool);
+  assert.deepEqual(config, before);
+  assert.equal(saves, 0);
+});
 function bounded(promise, ms = 300) {
   let timer;
   return Promise.race([

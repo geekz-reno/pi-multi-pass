@@ -5359,6 +5359,7 @@ function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
 				window.hours = [start, end];
 				continue;
 			}
+			return null;
 		}
 		// Day range: "mon-fri" or single day: "mon"
 		const dayRangeMatch = part.match(/^([a-z]{3})-([a-z]{3})$/);
@@ -5389,11 +5390,31 @@ function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
 		const dateMatch = part.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
 		if (dateMatch) {
 			window.dateRange = { from: dateMatch[1], to: dateMatch[2] };
+			continue;
 		}
+		// A partially recognized window would silently discard a constraint.
+		return null;
 	}
 
 	if (!window.hours && !window.days && !window.dateRange) return null;
 	return window;
+}
+
+async function promptForScheduleWindows(
+	ctx: ExtensionCommandContext,
+	member: string,
+): Promise<ScheduleWindow[] | undefined> {
+	while (true) {
+		const input = await ctx.ui.input(
+			`Time window for ${member}`,
+			"hours e.g. 9-17, days e.g. mon-fri (or leave empty for always)",
+		);
+		if (input === undefined) return undefined;
+		if (!input.trim()) return [];
+		const window = parseScheduleWindowInput(input.trim());
+		if (window) return [window];
+		ctx.ui.notify(`Invalid time window "${input.trim()}". Try e.g. "9-17 mon-fri".`, "warning");
+	}
 }
 
 function buildPoolConfig(input: {
@@ -5721,24 +5742,9 @@ async function promptForPoolDefinition(
 			else if (rolePick.startsWith("overflow")) role = "overflow";
 
 			if (role === "preferred") {
-				const windowDef = await ctx.ui.input(
-					`Time window for ${member}`,
-					"hours e.g. 9-17, days e.g. mon-fri (or leave empty for always)",
-				);
-				const schedule: MemberSchedule = { role, windows: [] };
-				if (windowDef?.trim()) {
-					const window = parseScheduleWindowInput(windowDef.trim());
-					if (window) schedule.windows = [window];
-					else {
-						// An unrecognized window must not silently degrade into an
-						// always-active preferred member.
-						ctx.ui.notify(
-							`Time window "${windowDef.trim()}" was not recognized; ${member} will be always-active. Try e.g. "9-17 mon-fri".`,
-							"warning",
-						);
-					}
-				}
-				memberSchedule[member] = schedule;
+				const windows = await promptForScheduleWindows(ctx, member);
+				if (!windows) return undefined;
+				memberSchedule[member] = { role, windows };
 			} else if (role === "overflow") {
 				memberSchedule[member] = { role };
 			}
@@ -5991,14 +5997,6 @@ async function changePoolStrategy(
 		return;
 	}
 
-	if (nextStrategy === "round-robin") {
-		delete pool.strategy;
-		delete pool.memberSchedule;
-		delete pool.selectorScript;
-	} else {
-		pool.strategy = nextStrategy;
-	}
-
 	// Collect strategy-specific config
 	if (nextStrategy === "scheduled") {
 		const memberSchedule: Record<string, MemberSchedule> = {};
@@ -6016,24 +6014,9 @@ async function changePoolStrategy(
 			else if (rolePick.startsWith("overflow")) role = "overflow";
 
 			if (role === "preferred") {
-				const windowDef = await ctx.ui.input(
-					`Time window for ${member}`,
-					"e.g. 9-17 mon-fri",
-				);
-				const schedule: MemberSchedule = { role, windows: [] };
-				if (windowDef?.trim()) {
-					const window = parseScheduleWindowInput(windowDef.trim());
-					if (window) schedule.windows = [window];
-					else {
-						// An unrecognized window must not silently degrade into an
-						// always-active preferred member.
-						ctx.ui.notify(
-							`Time window "${windowDef.trim()}" was not recognized; ${member} will be always-active. Try e.g. "9-17 mon-fri".`,
-							"warning",
-						);
-					}
-				}
-				memberSchedule[member] = schedule;
+				const windows = await promptForScheduleWindows(ctx, member);
+				if (!windows) return;
+				memberSchedule[member] = { role, windows };
 			} else if (role === "overflow") {
 				memberSchedule[member] = { role };
 			}
@@ -6046,8 +6029,7 @@ async function changePoolStrategy(
 			`e.g. selectors/my-pool.js (relative to ${getAgentDir()}/)`,
 		);
 		if (!scriptPath?.trim()) {
-			ctx.ui.notify("No script path provided. Reverting to round-robin.", "warning");
-			delete pool.strategy;
+			ctx.ui.notify("No script path provided. Strategy unchanged.", "warning");
 			return;
 		}
 		pool.selectorScript = scriptPath.trim();
@@ -6056,6 +6038,13 @@ async function changePoolStrategy(
 	} else if (nextStrategy === "quota-first" || nextStrategy === "weighted") {
 		delete pool.memberSchedule;
 		delete pool.selectorScript;
+	}
+	if (nextStrategy === "round-robin") {
+		delete pool.strategy;
+		delete pool.memberSchedule;
+		delete pool.selectorScript;
+	} else {
+		pool.strategy = nextStrategy;
 	}
 
 	saveGlobalConfig(config);
