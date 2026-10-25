@@ -40,6 +40,7 @@ import {
 	mkdirSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "fs";
@@ -479,6 +480,11 @@ async function withAuthFile<T>(
 		if (changed && isOmp) {
 			for (const [provider, credential] of Object.entries(stored)) {
 				if (credential !== previous[provider]) await ompAuth.credentials.set(provider, credential);
+			}
+			// Deletions must propagate too: an edit that removed a provider
+			// would otherwise survive in the OMP credential store forever.
+			for (const provider of Object.keys(previous)) {
+				if (!(provider in stored)) await ompAuth.credentials.remove(provider);
 			}
 		} else if (changed) writeFileSync(path, JSON.stringify(stored, null, 2), { mode: 0o600 });
 		return value;
@@ -1801,6 +1807,14 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 		});
 
 		try {
+			// The profile request is independent of the usage payload: run both
+			// round-trips concurrently instead of paying two sequential RTTs.
+			// fetchAnthropicProfile only rejects on abort; swallow that here so
+			// an aborted profile call cannot outlive this checker as an
+			// unhandled rejection when the usage fetch fails first.
+			const profilePromise = fetchAnthropicProfile(headers, signal).catch(
+				() => ({ planType: "unknown", email: "" }),
+			);
 			const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
 				method: "GET",
 				headers,
@@ -1824,7 +1838,7 @@ const anthropicQuotaChecker: ProviderQuotaChecker = {
 
 			const rawData = await response.json();
 			const snapshot = parseAnthropicUsageSnapshot(rawData);
-			const profile = await fetchAnthropicProfile(headers, signal);
+			const profile = await profilePromise;
 			snapshot.planType = profile.planType;
 			snapshot.email = profile.email;
 
@@ -2833,20 +2847,25 @@ function subModelName(entry: SubEntry, originalName: string): string {
 	const parts: string[] = [originalName];
 	if (entry.label) parts.push(entry.label);
 	else parts.push(`#${entry.index}`);
-	try {
-		const credential = readStoredCredential(subProviderName(entry)) as
-			| AuthStorageEntry
-			| undefined;
-		const cached = accountEmailCache.get(subProviderName(entry));
-		const email = cached
-			?? (typeof credential?.email === "string" ? credential.email : undefined)
-			?? extractEmailFromJwt(
-				typeof credential?.access === "string" ? credential.access : undefined,
-			);
-		if (email) parts.push(email);
-	} catch {
-		// best effort; just omit the email
+	// Cache first: this runs once per model on every refreshModels cycle, so a
+	// warm cache must not touch the credential store at all.
+	const providerName = subProviderName(entry);
+	let email = accountEmailCache.get(providerName);
+	if (!email) {
+		try {
+			const credential = readStoredCredential(providerName) as
+				| AuthStorageEntry
+				| undefined;
+			email =
+				(typeof credential?.email === "string" ? credential.email : undefined) ??
+				extractEmailFromJwt(
+					typeof credential?.access === "string" ? credential.access : undefined,
+				);
+		} catch {
+			// best effort; just omit the email
+		}
 	}
+	if (email) parts.push(email);
 	return parts.join(" \u00b7 ");
 }
 
@@ -3188,27 +3207,42 @@ function resolveSelectorScriptPath(scriptPath: string): string {
 	return join(getAgentDir(), scriptPath);
 }
 
+/** Drop every cached variant (any mtime) of one selector script. */
+function forgetSelectorScript(scriptPath: string): void {
+	const resolved = resolveSelectorScriptPath(scriptPath);
+	for (const key of selectorCache.keys()) {
+		if (key === resolved || key.startsWith(`${resolved}?mtime=`)) selectorCache.delete(key);
+	}
+}
+
 async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | null> {
 	const resolved = resolveSelectorScriptPath(scriptPath);
-	const cached = selectorCache.get(resolved);
-	if (cached !== undefined) return cached;
-
-	if (!existsSync(resolved)) {
-		selectorCache.set(resolved, null);
+	// Key on mtime as well: users iterate on selector scripts, and a path-only
+	// cache would keep serving the first imported version until process restart.
+	let mtimeMs = 0;
+	try {
+		mtimeMs = statSync(resolved).mtimeMs;
+	} catch {
+		forgetSelectorScript(scriptPath);
 		return null;
 	}
+	const cacheKey = `${resolved}?mtime=${mtimeMs}`;
+	const cached = selectorCache.get(cacheKey);
+	if (cached !== undefined) return cached;
+
+	forgetSelectorScript(scriptPath);
 
 	try {
-		const mod = await import(pathToFileURL(resolved).href);
+		const mod = await import(`${pathToFileURL(resolved).href}?mtime=${mtimeMs}`);
 		const fn: PoolSelectorFn = typeof mod.default === "function"
 			? mod.default
 			: typeof mod === "function"
 				? mod
 				: null;
-		selectorCache.set(resolved, fn);
+		selectorCache.set(cacheKey, fn);
 		return fn;
 	} catch {
-		selectorCache.set(resolved, null);
+		selectorCache.set(cacheKey, null);
 		return null;
 	}
 }
@@ -3642,36 +3676,6 @@ class PoolManager {
 		const now = Date.now();
 		state.exhausted.set(providerName, now);
 		state.retryAt.set(providerName, now + parseCooldownMs(errorMessage, now, state.cooldownMs, resetAtSeconds));
-	}
-
-	/** Get the next available member in a pool, skipping the current one */
-	getNextMember(
-		pool: PoolConfig,
-		currentProvider: string,
-		authStorage: { hasAuth(provider: string): boolean },
-	): string | undefined {
-		const state = this.getOrCreatePoolState(pool.name);
-		const available = this.getAvailableMembers(pool, authStorage);
-		if (available.length === 0) return undefined;
-
-		const poolSize = pool.members.length;
-		if (poolSize <= 1) {
-			return available[0] === currentProvider ? undefined : available[0];
-		}
-
-		const currentIndex = pool.members.indexOf(currentProvider);
-		const startIndex = currentIndex >= 0 ? currentIndex : state.currentIndex % poolSize;
-
-		for (let step = 1; step <= poolSize; step++) {
-			const candidateIndex = (startIndex + step) % poolSize;
-			const candidate = pool.members[candidateIndex];
-			if (candidate === currentProvider) continue;
-			if (!available.includes(candidate)) continue;
-			state.currentIndex = candidateIndex;
-			return candidate;
-		}
-
-		return undefined;
 	}
 
 	resetStartupSelection(): void {
@@ -4144,10 +4148,6 @@ class PoolManager {
 
 	getPoolConfigs(): PoolConfig[] {
 		return Array.from(this.pools.values());
-	}
-
-	getAllPoolConfigs(config: MultiPassConfig): PoolConfig[] {
-		return config.pools || [];
 	}
 }
 
@@ -4815,7 +4815,11 @@ function getStoredAccountEmail(
 
 /** Fill accountEmailCache for providers whose stored credential does not
  * carry an email (currently Anthropic, whose OAuth token is opaque). One
- * profile request per provider, cached for the process lifetime. */
+ * profile request per provider, cached for the process lifetime. Failures
+ * are negatively cached for a few minutes so a broken/slow profile endpoint
+ * cannot stall (or be re-hit on) every dashboard redraw. */
+const anthropicProfileRetryAt = new Map<string, number>();
+const ANTHROPIC_PROFILE_RETRY_MS = 5 * 60_000;
 async function resolveAccountEmails(
 	providerNames: string[],
 	authStorage: AuthStorageCompat,
@@ -4826,15 +4830,19 @@ async function resolveAccountEmails(
 		if (base !== "anthropic") return;
 		const auth = authStorage.get(providerName);
 		if (typeof auth?.access !== "string" || !auth.access) return;
+		const retryAt = anthropicProfileRetryAt.get(providerName) ?? 0;
+		if (Date.now() < retryAt) return;
 		try {
 			const profile = await fetchAnthropicProfile(new Headers({
 				Authorization: `Bearer ${auth.access}`,
 				"anthropic-beta": ANTHROPIC_OAUTH_BETA,
 				Accept: "application/json",
-			}));
+			}), AbortSignal.timeout(5_000));
 			if (profile.email) accountEmailCache.set(providerName, profile.email);
+			else anthropicProfileRetryAt.set(providerName, Date.now() + ANTHROPIC_PROFILE_RETRY_MS);
 		} catch {
 			// best effort; the list simply shows no email
+			anthropicProfileRetryAt.set(providerName, Date.now() + ANTHROPIC_PROFILE_RETRY_MS);
 		}
 	}));
 }
@@ -5344,7 +5352,10 @@ function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
 		if (hourMatch) {
 			const start = parseInt(hourMatch[1], 10);
 			const end = parseInt(hourMatch[2], 10);
-			if (start >= 0 && start <= 23 && end >= 0 && end <= 23) {
+			// start === end is rejected: isInHourRange treats [h, h] as
+			// hour >= h && hour < h — never active — so accepting it would
+			// silently configure a preferred member that can never serve.
+			if (start >= 0 && start <= 23 && end >= 0 && end <= 23 && start !== end) {
 				window.hours = [start, end];
 				continue;
 			}
@@ -5718,6 +5729,14 @@ async function promptForPoolDefinition(
 				if (windowDef?.trim()) {
 					const window = parseScheduleWindowInput(windowDef.trim());
 					if (window) schedule.windows = [window];
+					else {
+						// An unrecognized window must not silently degrade into an
+						// always-active preferred member.
+						ctx.ui.notify(
+							`Time window "${windowDef.trim()}" was not recognized; ${member} will be always-active. Try e.g. "9-17 mon-fri".`,
+							"warning",
+						);
+					}
 				}
 				memberSchedule[member] = schedule;
 			} else if (role === "overflow") {
@@ -6005,6 +6024,14 @@ async function changePoolStrategy(
 				if (windowDef?.trim()) {
 					const window = parseScheduleWindowInput(windowDef.trim());
 					if (window) schedule.windows = [window];
+					else {
+						// An unrecognized window must not silently degrade into an
+						// always-active preferred member.
+						ctx.ui.notify(
+							`Time window "${windowDef.trim()}" was not recognized; ${member} will be always-active. Try e.g. "9-17 mon-fri".`,
+							"warning",
+						);
+					}
 				}
 				memberSchedule[member] = schedule;
 			} else if (role === "overflow") {
@@ -6024,7 +6051,7 @@ async function changePoolStrategy(
 			return;
 		}
 		pool.selectorScript = scriptPath.trim();
-		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
+		forgetSelectorScript(pool.selectorScript);
 		delete pool.memberSchedule;
 	} else if (nextStrategy === "quota-first" || nextStrategy === "weighted") {
 		delete pool.memberSchedule;
@@ -7712,13 +7739,20 @@ function statusBarShortName(providerName: string, subs: SubEntry[]): string {
 	return entry ? `${short}#${entry.index}` : short;
 }
 
-function collectStatusBarAccounts(ctx: ExtensionContext): StatusBarAccount[] {
+function statusBarAccountsFrom(
+	ctx: ExtensionContext,
+	quotaAccounts: QuotaAccount[],
+): StatusBarAccount[] {
 	const subs = normalizeEntries(mergeConfigs(loadGlobalConfig(), parseEnvConfig()));
-	return collectQuotaAccounts(ctx).map((account) => ({
+	return quotaAccounts.map((account) => ({
 		providerName: account.providerName,
 		shortName: statusBarShortName(account.providerName, subs),
 		glyph: STATUS_BAR_GLYPHS[account.baseProvider] || "\u25cf",
 	}));
+}
+
+function collectStatusBarAccounts(ctx: ExtensionContext): StatusBarAccount[] {
+	return statusBarAccountsFrom(ctx, collectQuotaAccounts(ctx));
 }
 
 function sameQuotaAccounts(left: QuotaAccount[], right: QuotaAccount[]): boolean {
@@ -7743,12 +7777,16 @@ function knownQuotaResetAt(ctx: ExtensionContext, provider: string | undefined):
 }
 
 function updateStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void {
+	// Collect once per tick: each collect re-reads the config files and auth
+	// store, and this runs every STATUS_BAR_CLOCK_MS on OMP.
 	const accounts = collectQuotaAccounts(ctx);
 	const changed = !sameQuotaAccounts([...statusBarQuota.values()].map((result) => result.account), accounts);
 	if (changed) statusBarQuota.clear();
-	statusBarAccounts = collectStatusBarAccounts(ctx);
+	statusBarAccounts = statusBarAccountsFrom(ctx, accounts);
 	if (changed || Date.now() - statusBarQuotaFetchedAt > STATUS_BAR_QUOTA_REFRESH_MS) {
 		refreshStatusBarQuota(ctx, onDone);
+	} else {
+		onDone();
 	}
 }
 
@@ -7757,8 +7795,8 @@ function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void 
 		void statusBarRefreshInFlight.then(onDone);
 		return;
 	}
-	statusBarAccounts = collectStatusBarAccounts(ctx);
 	const accounts = collectQuotaAccounts(ctx);
+	statusBarAccounts = statusBarAccountsFrom(ctx, accounts);
 	let selectionChanged = false;
 	statusBarRefreshInFlight = runQuotaChecks(accounts)
 		.then((results) => {

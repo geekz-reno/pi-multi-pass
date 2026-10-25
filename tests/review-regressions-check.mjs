@@ -325,6 +325,7 @@ test("a timed-out widget refresh releases its lock and the next refresh recovers
   const accounts = [quotaAccount("quota")];
   const code = `let statusBarRefreshInFlight; let statusBarAccounts = []; const statusBarQuota = new Map(); let statusBarQuotaFetchedAt = 0;\n${quotaCode}\n${piece("function sameQuotaAccounts(", "function updateStatusBarQuota(")}\n${piece("function refreshStatusBarQuota(", "function shortenPathForStatusBar(")}`;
   const widget = load(code, {
+    statusBarAccountsFrom: () => [],
     collectStatusBarAccounts: () => [],
     collectQuotaAccounts: () => accounts,
     PROVIDER_QUOTA_CHECKERS: [{ baseProvider: "quota", check: async (account) => {

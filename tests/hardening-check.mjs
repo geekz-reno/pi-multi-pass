@@ -8,7 +8,8 @@ const source = await readFile(
 );
 
 assert.match(source, /if \(isAbsolute\(scriptPath\)\) return scriptPath;/);
-assert.match(source, /import\(pathToFileURL\(resolved\)\.href\)/);
+// The import URL must derive from the validated resolved path (mtime query busts the module cache for edited selectors).
+assert.match(source, /import\(`\$\{pathToFileURL\(resolved\)\.href\}\?mtime=\$\{mtimeMs\}`\)/);
 assert.match(source, /function saveJsonConfig\(path: string, config: unknown\): void/);
 assert.match(source, /copyFileSync\(path, backupPath\)/);
 assert.match(source, /renameSync\(temporaryPath, path\)/);

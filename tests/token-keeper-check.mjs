@@ -14,9 +14,11 @@ assert.match(source, /const run = withAuthFile\(async \(stored\) => \{/);
 assert.match(source, /stored\[account\] = \{ \.\.\.current, \.\.\.refreshed, type: "oauth" \};\n\t\treturn \{ value: refreshed, changed: true \};/);
 
 // A token another process already rotated is reused instead of refreshed again.
+// (The skew became a parameter when the token keeper started passing its own
+// early-refresh lead; the builtin flow keeps AUTH_REFRESH_SKEW_MS.)
 assert.match(
 	source,
-	/if \(isOAuthEntry\(current\) && current\.expires > Date\.now\(\) \+ AUTH_REFRESH_SKEW_MS\) \{/,
+	/if \(isOAuthEntry\(current\) && current\.expires > Date\.now\(\) \+ refreshSkewMs\) \{/,
 );
 
 // The refresh deadline is the extension's own, not pi's 15s request deadline.
